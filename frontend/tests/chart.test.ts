@@ -250,7 +250,11 @@ describe('demo chart', () => {
     expect(demo.schemaVersion).toBe(BEATMAP_SCHEMA_VERSION);
     expect(demo.bpm).toBe(150);
     expect(demo.offsetMs).toBe(0);
-    expect(demo.difficulty).toBe('normal');
+    // Seven keys, so the demo is Hard (phase 3): its scores carry Hard's weight and its highway is
+    // the seven-lane one it always was.
+    expect(demo.difficulty).toBe('hard');
+    expect(demo.laneCount).toBe(7);
+    expect(demo.maxScore).toBeGreaterThan(0);
     expect(demo.title.length).toBeGreaterThan(0);
     expect(prepareBeatmap(demo).notes).toHaveLength(demo.notes.length);
   });

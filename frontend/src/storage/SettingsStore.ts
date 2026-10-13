@@ -11,7 +11,7 @@
  */
 
 import type { GameSettings } from '../game/GameConfig';
-import { DEFAULT_SETTINGS, NOTE_SPEED_LIMITS, OFFSET_LIMITS } from '../game/GameConfig';
+import { DEFAULT_SETTINGS, NOTE_SPEED_LIMITS, OFFSET_LIMITS, clampLanePalette } from '../game/GameConfig';
 
 export const SETTINGS_STORAGE_KEY = 'seven-keys.settings.v1';
 
@@ -39,6 +39,9 @@ export function clampSettings(input: Partial<GameSettings>): GameSettings {
     globalOffsetMs: clamp(roundToStep(merged.globalOffsetMs, OFFSET_LIMITS.step), OFFSET_LIMITS.min, OFFSET_LIMITS.max),
     noteSpeed: clamp(roundToStep(merged.noteSpeed, NOTE_SPEED_LIMITS.step), NOTE_SPEED_LIMITS.min, NOTE_SPEED_LIMITS.max),
     volume: clamp(merged.volume, 0, 1),
+    // A removed or renamed palette must not poison the setting: the id is validated against the
+    // palette catalogue and falls back to the default theme.
+    lanePalette: clampLanePalette(merged.lanePalette),
   };
 }
 

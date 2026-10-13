@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_SCORE_RULES, gradeForAccuracy, isComboIncreasing } from '../src/game/GameConfig';
+import { perfectRunScore } from '../src/chart/ScoreModel';
 import { ScoreManager } from '../src/game/ScoreManager';
 
 describe('combo rules', () => {
@@ -151,8 +152,16 @@ describe('results', () => {
     // (300*3 + 100) / (300*4) = 0.8333 -> B
     expect(results.accuracy).toBeCloseTo(0.8333333, 6);
     expect(results.grade).toBe('B');
-    // Theoretical maximum: every note PERFECT at the maximum 2x multiplier.
-    expect(results.maxScore).toBe(DEFAULT_SCORE_RULES.basePoints.perfect * 4 * 2);
+    // Theoretical maximum: a flawless run of these four notes, from combo 1 up — 303 + 306 + 309 +
+    // 312 at weight 1. (It is *not* "four notes at the capped 2× multiplier", which no play can
+    // reach; see `perfectRunScore` and PHASE3_1_NOTES.md.)
+    expect(results.maxScore).toBe(303 + 306 + 309 + 312);
+    expect(results.maxScore).toBe(
+      perfectRunScore(
+        Array.from({ length: 4 }, (_, index) => ({ timeMs: index * 1000, lane: 0, type: 'tap' as const })),
+        1,
+      ),
+    );
     expect(results.counts).toEqual({ perfect: 3, good: 0, bad: 1, miss: 0 });
   });
 });

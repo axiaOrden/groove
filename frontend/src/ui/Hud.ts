@@ -12,9 +12,9 @@
 import type { JudgmentType } from '../game/GameConfig';
 import { JUDGMENT_LABELS } from '../game/JudgmentEngine';
 import type { ScoreSnapshot } from '../game/ScoreManager';
-import { LANE_COLORS, LANE_COUNT } from '../renderer/Layout';
+import { LANE_COUNT, laneColorsFor, setActiveLanePalette } from '../renderer/Layout';
 import { el, formatClock, formatPercent, formatOffset, restartAnimation, setAttr, setText } from './dom';
-import { LANE_KEYS } from '../game/GameConfig';
+import { keyLabelsFor, type ChartDifficulty } from '../chart/Difficulty';
 
 export interface HudFrame {
   snapshot: ScoreSnapshot;
@@ -25,6 +25,11 @@ export interface HudFrame {
   countInRemainingMs: number;
   beatMs: number;
   countInMs: number;
+  /** Difficulty of the chart being played, shown next to the counters (phase 3). */
+  difficulty: ChartDifficulty;
+  laneCount: number;
+  /** Theoretical maximum for this chart at its difficulty weight. */
+  maxScore: number;
 }
 
 const JUDGEMENT_POOL_SIZE = 14;
@@ -48,6 +53,9 @@ export class Hud {
   private readonly countdown = el('hud-countdown');
   private readonly judgementLayer = el('judgement-layer');
   private readonly keyHints = el('key-hints');
+  private readonly difficulty = el('stat-difficulty');
+  private readonly maxScore = el('stat-maxscore');
+  private lanesValue = LANE_COUNT;
 
   private readonly judgementPool: HTMLElement[] = [];
   private judgementCursor = 0;
@@ -55,8 +63,26 @@ export class Hud {
   private lastCountdownText = '';
 
   constructor() {
-    this.buildKeyHints();
+    this.buildKeyHints(LANE_COUNT);
     this.buildJudgementPool();
+  }
+
+  get laneCount(): number {
+    return this.lanesValue;
+  }
+
+  /** Rebuild the key strip for a lane count (the difficulty's keys, in lane order). */
+  setLaneCount(laneCount: number): void {
+    const lanes = Math.max(1, Math.min(LANE_COUNT, Math.round(laneCount) || LANE_COUNT));
+    if (lanes === this.lanesValue && this.keyHints.children.length === lanes) return;
+    this.lanesValue = lanes;
+    this.buildKeyHints(lanes);
+  }
+
+  /** Repaint the key strip in another lane palette (the lanes' colours come from one definition). */
+  setPalette(paletteId: string): void {
+    setActiveLanePalette(paletteId);
+    this.buildKeyHints(this.lanesValue);
   }
 
   update(frame: HudFrame): void {
@@ -72,6 +98,11 @@ export class Hud {
     setText(this.bad, String(snapshot.counts.bad));
     setText(this.miss, String(snapshot.counts.miss));
     setText(this.holds, String(snapshot.holdCompleted));
+    setText(this.difficulty, `${frame.difficulty} · ${frame.laneCount} keys`);
+    // The maximum is the score of a flawless run (see `chart/ScoreModel`), so the percentage beside
+    // it is honest: it reads 100.00 % on a perfect run and never exceeds it.
+    const maxRatio = frame.maxScore > 0 ? Math.min(1, snapshot.score / frame.maxScore) : 0;
+    setText(this.maxScore, `${frame.maxScore.toLocaleString('en-US')} · ${formatPercent(maxRatio)}`);
 
     const ratio = durationMs > 0 ? Math.min(1, Math.max(0, songTimeMs / durationMs)) : 0;
     this.progress.style.width = `${(ratio * 100).toFixed(2)}%`;
@@ -136,7 +167,7 @@ export class Hud {
   }
 
   clearLaneStates(): void {
-    for (let lane = 0; lane < LANE_COUNT; lane += 1) this.setLaneActive(lane, false);
+    for (let lane = 0; lane < this.lanesValue; lane += 1) this.setLaneActive(lane, false);
   }
 
   show(visible: boolean): void {
@@ -158,14 +189,19 @@ export class Hud {
     this.clearLaneStates();
   }
 
-  private buildKeyHints(): void {
+  private buildKeyHints(laneCount: number): void {
     this.keyHints.replaceChildren();
-    LANE_KEYS.forEach((entry, index) => {
+    const labels = keyLabelsFor(laneCount);
+    const colors = laneColorsFor(laneCount);
+    labels.forEach((label, index) => {
       const pill = document.createElement('div');
       pill.className = 'key';
       pill.dataset.active = 'false';
-      pill.style.setProperty('--lane-color', `#${LANE_COLORS[index % LANE_COLORS.length]!.toString(16).padStart(6, '0')}`);
-      pill.innerHTML = `<span>${entry.label}</span>`;
+      pill.style.setProperty(
+        '--lane-color',
+        `#${(colors[index] ?? colors[0] ?? 0xffffff).toString(16).padStart(6, '0')}`,
+      );
+      pill.innerHTML = `<span>${label}</span>`;
       this.keyHints.appendChild(pill);
     });
   }

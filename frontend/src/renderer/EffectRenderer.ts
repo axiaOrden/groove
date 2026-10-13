@@ -10,7 +10,7 @@
  */
 
 import * as THREE from 'three';
-import { JUDGMENT_COLORS, laneToX } from './Layout';
+import { JUDGMENT_COLORS, LANE_COUNT, laneToX } from './Layout';
 
 export type EffectKind = keyof typeof JUDGMENT_COLORS;
 
@@ -64,6 +64,7 @@ export class EffectRenderer {
   private readonly geometry: THREE.PlaneGeometry;
   private readonly texture: THREE.Texture;
   private cursor = 0;
+  private lanesValue = LANE_COUNT;
 
   /** Number of rings drawn on the last update (debug/telemetry). */
   activeCount = 0;
@@ -91,6 +92,11 @@ export class EffectRenderer {
     parent.add(this.group);
   }
 
+  /** Follow a chart's lane count, so a four-lane chart's feedback lands on four columns. */
+  setLaneCount(laneCount: number): void {
+    this.lanesValue = Math.max(1, Math.min(LANE_COUNT, Math.round(laneCount) || LANE_COUNT));
+  }
+
   /** Fire a ring at a lane. `atMs` is song time, so effects pause with the music. */
   spawn(lane: number, kind: EffectKind, atMs: number, strength = 1): void {
     const profile = KIND_PROFILE[kind] ?? KIND_PROFILE.good!;
@@ -106,7 +112,7 @@ export class EffectRenderer {
     mesh.visible = true;
     mesh.material.color.setHex(profile.color);
     mesh.material.opacity = 0.95;
-    mesh.position.set(laneToX(lane), 0.1, 0);
+    mesh.position.set(laneToX(lane, this.lanesValue), 0.1, 0);
     mesh.scale.setScalar(0.9);
   }
 

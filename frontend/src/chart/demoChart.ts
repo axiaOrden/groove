@@ -9,7 +9,9 @@
  */
 
 import type { Beatmap, ChartNote } from './ChartTypes';
-import { BEATMAP_SCHEMA_VERSION, sortNotes } from './ChartTypes';
+import { BEATMAP_SCHEMA_VERSION, LANE_COUNT, sortNotes } from './ChartTypes';
+import { DIFFICULTY_PROFILES, keyLabelsFor } from './Difficulty';
+import { maxTheoreticalScoreOf } from './ScoreModel';
 import { ChartPatternError, assertUniformStepCount, parseBarPattern } from './PatternParser';
 import {
   DEMO_BAR_MS,
@@ -58,20 +60,31 @@ export function buildDemoNotes(): ChartNote[] {
   return sortNotes(notes);
 }
 
-/** The fixed Phase 1 beatmap. `offsetMs` is 0: the synthesised track starts exactly at 0. */
+/**
+ * The fixed Phase 1 beatmap. `offsetMs` is 0: the synthesised track starts exactly at 0.
+ *
+ * `difficulty` is `hard` since phase 3: the demo is the seven-key layout (A S D SPACE J K L), which
+ * is what Hard means, so its scores carry Hard's ×2.0 weight. Nothing else about it changed, and the
+ * other two difficulties are absent rather than faked — the demo has no analysis to generate them
+ * from (see `ui/GameApp.ts`).
+ */
 export function buildDemoChart(): Beatmap {
+  const notes = buildDemoNotes();
   return {
     schemaVersion: BEATMAP_SCHEMA_VERSION,
     songId: DEMO_SONG_ID,
     title: DEMO_TITLE,
     artist: DEMO_ARTIST,
     charter: DEMO_CHARTER,
-    difficulty: 'normal',
+    difficulty: 'hard',
+    laneCount: LANE_COUNT,
+    keyLabels: keyLabelsFor(LANE_COUNT),
     bpm: DEMO_BPM,
     offsetMs: 0,
     generator: { ...DEMO_GENERATOR },
     durationMs: demoSongDurationMs(),
-    notes: buildDemoNotes(),
+    maxScore: maxTheoreticalScoreOf(notes, DIFFICULTY_PROFILES.hard.scoreWeight),
+    notes,
   };
 }
 

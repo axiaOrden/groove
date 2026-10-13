@@ -1,9 +1,13 @@
 /**
- * TouchSurface — the seven lane columns a finger can hit.
+ * TouchSurface — the lane columns a finger can hit.
  *
  * This is deliberately *not* a second gameplay surface: it owns no rules, no clock and no
- * state beyond "which lane is lit". Its only job is to put seven DOM columns exactly where the
- * seven 3D lane columns are, and to hand pointer events to `InputManager`.
+ * state beyond "which lane is lit". Its only job is to put N DOM columns exactly where the N 3D
+ * lane columns are, and to hand pointer events to `InputManager`.
+ *
+ * Phase 3: the columns are rebuilt for the chart's lane count (`setLaneCount`), so Easy gets four
+ * wide columns and Hard seven — the columns are derived from the same projection as the lanes, so
+ * the two always agree. Keys A S K L are also touch pads on Easy; there is no disabled column.
  *
  * Geometry comes from the same projection the renderer uses (`CameraFraming`), so the columns
  * are derived from the camera rather than approximated from CSS percentages:
@@ -31,9 +35,9 @@
  * comparisons and no layout work — which is what keeps 120 Hz touch panels happy.
  */
 
-import { LANE_KEYS } from '../game/GameConfig';
-import { LANE_COLORS } from '../renderer/Layout';
+import { LANE_COUNT, laneColorsFor, setActiveLanePalette } from '../renderer/Layout';
 import type { Framing } from '../renderer/CameraFraming';
+import { keyLabelsFor } from '../chart/Difficulty';
 
 export interface TouchSurfaceLayout {
   /** Projected lane centres at the hit line, in viewport px. */
@@ -70,16 +74,45 @@ const VERTICAL_SLACK_PX = 12;
 
 export class TouchSurface {
   readonly root: HTMLElement;
-  private readonly zones: HTMLElement[] = [];
-  private readonly pads: HTMLElement[] = [];
+  private zones: HTMLElement[] = [];
+  private pads: HTMLElement[] = [];
   /** Client-space rectangles, one per lane, refreshed by `layout()`. */
   private lastRects: ZoneRect[] = [];
   private interactive = false;
+  private lanesValue = LANE_COUNT;
+  private labels: readonly string[] = [];
 
   constructor(root: HTMLElement) {
     this.root = root;
-    this.build();
+    this.lanesValue = LANE_COUNT;
+    this.build(LANE_COUNT);
     this.applyInteractive(false);
+  }
+
+  get laneCount(): number {
+    return this.lanesValue;
+  }
+
+  /**
+   * Rebuild the columns for a lane count (and the key labels drawn on the pads). Idempotent, so it
+   * can be called on every chart load.
+   */
+  setLaneCount(laneCount: number, labels: readonly string[] = []): void {
+    const lanes = Math.max(1, Math.min(LANE_COUNT, Math.round(laneCount) || LANE_COUNT));
+    const sameLabels = labels.length === lanes && labels.join('\u0000') === this.labels.join('\u0000');
+    if (lanes === this.lanesValue && this.zones.length === lanes && sameLabels) return;
+    const wasInteractive = this.interactive;
+    this.lanesValue = lanes;
+    this.build(lanes, labels);
+    this.applyInteractive(wasInteractive);
+  }
+
+  /** Repaint the pad columns in another lane palette (the same definition the highway uses). */
+  setPalette(paletteId: string): void {
+    setActiveLanePalette(paletteId);
+    const wasInteractive = this.interactive;
+    this.build(this.lanesValue, this.labels);
+    this.applyInteractive(wasInteractive);
   }
 
   /**
@@ -205,23 +238,27 @@ export class TouchSurface {
   private originX = 0;
   private originY = 0;
 
-  private build(): void {
+  private build(laneCount: number, labels: readonly string[] = []): void {
     this.root.replaceChildren();
-    this.zones.length = 0;
-    this.pads.length = 0;
-    for (let lane = 0; lane < LANE_KEYS.length; lane += 1) {
+    this.zones = [];
+    this.pads = [];
+    const colors = laneColorsFor(laneCount);
+    const resolved = labels.length === laneCount ? labels : keyLabels(laneCount);
+    this.labels = resolved;
+    for (let lane = 0; lane < laneCount; lane += 1) {
       const zone = document.createElement('div');
       zone.className = 'touch-zone';
       zone.dataset.lane = String(lane);
       zone.dataset.active = 'false';
       zone.setAttribute('aria-hidden', 'true');
-      zone.style.setProperty('--lane-color', colorFor(lane));
+      zone.style.setProperty('--lane-color', colorFor(colors, lane));
 
       const pad = document.createElement('div');
       pad.className = 'touch-pad';
       const label = document.createElement('span');
       label.className = 'touch-pad-label';
-      label.textContent = LANE_KEYS[lane]!.label === 'SPACE' ? '␣' : LANE_KEYS[lane]!.label;
+      const text = resolved[lane] ?? String(lane + 1);
+      label.textContent = text === 'SPACE' ? '␣' : text;
       pad.appendChild(label);
       zone.appendChild(pad);
 
@@ -232,8 +269,12 @@ export class TouchSurface {
   }
 }
 
-function colorFor(lane: number): string {
-  return `#${LANE_COLORS[lane % LANE_COLORS.length]!.toString(16).padStart(6, '0')}`;
+function colorFor(colors: readonly number[], lane: number): string {
+  return `#${(colors[lane] ?? colors[0] ?? 0xffffff).toString(16).padStart(6, '0')}`;
+}
+
+function keyLabels(laneCount: number): string[] {
+  return keyLabelsFor(laneCount);
 }
 
 function midpoint(a: number, b: number): number {

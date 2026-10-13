@@ -1,5 +1,5 @@
 /**
- * The import pipeline: file → decoded audio → analysis → chart → stored record.
+ * The import pipeline: file → decoded audio → analysis → **three charts** → stored record.
  *
  * Kept free of DOM access so the whole workflow can be driven from a test (and so the UI is only
  * responsible for showing progress and errors). The stages report a single monotonic 0..1 ratio:
@@ -7,19 +7,26 @@
  *   validate  0.00   file checks (instant, or a readable error)
  *   decode    0.02–0.30  Web Audio decode + channel copies
  *   analyse   0.30–0.86  the analysis worker (progress comes from the analysis itself)
- *   generate  0.86–0.94  chart generation + validation
- *   save      0.94–1.00  IndexedDB write (optional)
+ *   generate  0.86–0.94  chart generation (all three difficulties) + validation
+ *   transcode 0.90–0.95  optional OGG export
+ *   save      0.95–1.00  IndexedDB write (optional)
  *
  * The numbers are deliberately weighted by *how long each stage takes* on a real song (analysis
- * dominates), so the progress bar moves at a plausible rate instead of jumping.
+ * dominates), so the progress bar moves at a plausible rate instead of jumping. Generating three
+ * charts costs one extra generator run each (the generator is milliseconds; the analysis is
+ * seconds), which is why `generate` keeps a wide slice of the bar.
+ *
+ * The audio is analysed exactly once. Everything the difficulty picker shows was derived from that
+ * single pass (see `chart/DifficultySet.ts`), and every difficulty is validated on its own.
  */
 
 import type { AnalysisOptions, AnalysisResult } from '../analysis/types';
 import type { AnalysisClient, AnalysisProgress } from '../analysis/AnalysisClient';
-import { generateChart, type ChartStats } from '../chart/ChartGenerator';
+import type { ChartStats } from '../chart/ChartGenerator';
+import { generateChartSet, primaryChart, type ChartSet, type DifficultyCharts } from '../chart/DifficultySet';
+import { CHART_DIFFICULTIES, type ChartDifficulty } from '../chart/Difficulty';
 import type { Beatmap } from '../chart/ChartTypes';
 import type { ValidationResult } from '../chart/ChartValidator';
-import { validateBeatmap } from '../chart/ChartValidator';
 import { decodeAudioFile, describeFile, ImportError, type DecodedSong, type FileFacts } from './MusicImport';
 import { exportOggVorbis, oggEncoderAvailable, type OggExportResult } from './OggExport';
 import { buildSongRecord, makeSongId, titleFromFileName, type SongRecord } from '../storage/SongRecord';
@@ -45,12 +52,19 @@ export interface ImportOutcome {
   facts: FileFacts;
   buffer: AudioBuffer;
   record: SongRecord;
+  /** All generated difficulties, from one analysis. */
+  set: ChartSet;
+  charts: DifficultyCharts;
+  /** The chart the workflow opens on (Hard when it validates). */
   chart: Beatmap;
+  /** The opening chart's stats and validation, kept as the headline numbers. */
   stats: ChartStats;
   validation: ValidationResult;
   analysis: AnalysisResult;
   ogg: OggExportResult | null;
   warnings: string[];
+  /** Difficulties that were generated *and* passed validation, easy → hard. */
+  playable: ChartDifficulty[];
   /** True when the record was written to the library. */
   saved: boolean;
 }
@@ -99,26 +113,53 @@ export async function importSongFile(options: ImportOptions): Promise<ImportOutc
     report('analyzing', 0.3 + progress.ratio * 0.56, progress.detail ?? describeStage(progress.stage));
   });
 
-  report('generating', 0.86, 'generating chart');
+  report('generating', 0.86, 'generating charts (easy / normal / hard)');
   const seed = options.seed ?? 1;
   const title = options.title ?? titleFromFileName(facts.name);
-  const generated = generateChart(analysis, {
+  const set = generateChartSet(analysis, {
     seed,
     songId: makeSongId(facts, analysis.durationMs),
     title,
     ...(options.artist ? { artist: options.artist } : {}),
-    charter: 'automatic analysis (phase 2)',
+    charter: 'automatic analysis (phase 3)',
     durationMs: analysis.durationMs,
   });
-  const validation = validateBeatmap(generated.chart);
 
-  const warnings = [...analysis.warnings, ...generated.warnings];
-  if (!validation.ok) {
+  // Per-difficulty validation, and the rule that decides what a failure means.
+  //
+  // A chart that fails validation is *not* saved as playable: `ChartValidator` rejects the things
+  // that make a chart unfair (overlapping notes in one lane, out-of-range lanes), and shipping one
+  // because the other two were fine would put an unplayable difficulty in the picker. So failures
+  // are dropped with a warning, and if *nothing* survives the import fails as a whole — which is the
+  // honest answer for a track the analyser could not chart (three seconds of silence, say).
+  const playable: ChartDifficulty[] = [];
+  const failed: ChartDifficulty[] = [];
+  for (const difficulty of CHART_DIFFICULTIES) {
+    const entry = set.charts[difficulty];
+    if (!entry) continue;
+    if (entry.validation.ok) playable.push(difficulty);
+    else failed.push(difficulty);
+  }
+  if (playable.length === 0) {
+    const first = CHART_DIFFICULTIES.map((difficulty) => set.charts[difficulty]).find((entry) => entry !== undefined);
     throw new ImportError(
-      `The generated chart did not pass validation (${validation.errors.map((issue) => issue.code).join(', ')}). ` +
+      `The generated chart did not pass validation ` +
+        `(${(first?.validation.errors ?? []).map((issue) => issue.code).join(', ') || 'no notes'}). ` +
         'Try a longer or more rhythmic track.',
       'decode-failed',
     );
+  }
+  for (const difficulty of failed) delete set.charts[difficulty];
+
+  const opening = primaryChart(set);
+  if (opening === null) {
+    throw new ImportError('The generated chart set is empty.', 'decode-failed');
+  }
+  const generated = set.charts[opening.difficulty]!;
+  const validation = generated.validation;
+  const warnings = [...analysis.warnings, ...set.warnings];
+  for (const difficulty of failed) {
+    warnings.push(`${difficulty}: chart failed validation and was left out of the saved set`);
   }
 
   let ogg: OggExportResult | null = null;
@@ -142,9 +183,7 @@ export async function importSongFile(options: ImportOptions): Promise<ImportOutc
       transcoded: ogg !== null,
     },
     analysis,
-    chart: generated.chart,
-    stats: generated.stats,
-    validation,
+    charts: set.charts,
     ...(options.now ? { now: options.now } : {}),
   });
 
@@ -166,12 +205,15 @@ export async function importSongFile(options: ImportOptions): Promise<ImportOutc
     facts,
     buffer: decoded.buffer,
     record,
+    set,
+    charts: set.charts,
     chart: generated.chart,
     stats: generated.stats,
     validation,
     analysis,
     ogg,
     warnings,
+    playable,
     saved,
   };
 }

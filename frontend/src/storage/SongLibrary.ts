@@ -1,14 +1,21 @@
 /**
  * Song library persistence.
  *
- * Two object stores, and the split is the point:
+ * Object stores, and the split is the point:
  *
- *   `songs`  one record per song: chart, tempo, analysis metadata (see SongRecord). Small.
- *   `audio`  `{ id, blob, mimeType }` — the encoded audio bytes, keyed by the same id.
+ *   `songs`            one record per song: the chart set, tempo, analysis metadata (see
+ *                      SongRecord). Small.
+ *   `audio`            `{ id, blob, mimeType }` — the encoded audio bytes, keyed by the same id.
+ *   `scores`           best run per (song, difficulty) — see `ScoreStore` (phase 3).
+ *   `score-attempts`   how many times each (song, difficulty) has been played.
  *
  * Listing the library reads only `songs`, so opening the song picker never touches tens of
- * megabytes of audio. Saving is a single transaction across both stores, so a half-written song
+ * megabytes of audio. Saving is a single transaction across both song stores, so a half-written song
  * cannot be left behind by a crash or a reload.
+ *
+ * **Dropping a song drops its scores too** (`SongStore.remove`): an orphaned high score for a song
+ * that is no longer in the library could never be reached again, and the player's intent when they
+ * delete a song is to be rid of it.
  *
  * `SongStore` is an interface with two implementations:
  *
@@ -18,6 +25,9 @@
  *     errors, embedded webviews) and by the tests. The library then *works* for the session and
  *     the UI says so, which is a much better failure mode than an import that silently cannot be
  *     saved.
+ *
+ * The database version is 2 since phase 3: upgrading a version-1 database creates the two score
+ * stores in place, and every existing song, chart and audio blob is untouched by the bump.
  */
 
 import {
@@ -27,13 +37,24 @@ import {
   type SongRecord,
   type SongSummary,
 } from './SongRecord';
+import {
+  IndexedDbScoreStore,
+  MemoryScoreStore,
+  SCORE_ATTEMPTS_STORE,
+  SCORES_STORE,
+  requestToPromise,
+  transactionDone,
+  type ScoreStore,
+} from './ScoreStore';
 
 export type { SongRecord, SongSummary };
+export type { ScoreStore };
 
 export const LIBRARY_DB_NAME = 'seven-keys';
-export const LIBRARY_DB_VERSION = 1;
+export const LIBRARY_DB_VERSION = 2;
 export const SONGS_STORE = 'songs';
 export const AUDIO_STORE = 'audio';
+export { SCORES_STORE, SCORE_ATTEMPTS_STORE };
 
 export interface StoredAudioBlob {
   id: string;
@@ -50,6 +71,8 @@ export interface SongStore {
   readonly kind: 'indexeddb' | 'memory';
   /** False when the store cannot persist across reloads (memory fallback). */
   readonly persistent: boolean;
+  /** High scores recorded against these songs (separate per song and difficulty). */
+  readonly scores: ScoreStore;
   save(record: SongRecord, audio: StoredAudioBlob | null): Promise<void>;
   list(): Promise<SongSummary[]>;
   load(id: string): Promise<LoadedSong | null>;
@@ -58,26 +81,14 @@ export interface SongStore {
   close(): void;
 }
 
-function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error('IndexedDB request failed'));
-  });
-}
-
-function transactionDone(tx: IDBTransaction): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error ?? new Error('IndexedDB transaction failed'));
-    tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
-  });
-}
-
 export class IndexedDbSongStore implements SongStore {
   readonly kind = 'indexeddb' as const;
   readonly persistent = true;
+  readonly scores: ScoreStore;
 
-  constructor(private readonly db: IDBDatabase) {}
+  constructor(private readonly db: IDBDatabase) {
+    this.scores = new IndexedDbScoreStore(db);
+  }
 
   static async open(factory: IDBFactory = indexedDB): Promise<IndexedDbSongStore> {
     const request = factory.open(LIBRARY_DB_NAME, LIBRARY_DB_VERSION);
@@ -88,6 +99,14 @@ export class IndexedDbSongStore implements SongStore {
       }
       if (!db.objectStoreNames.contains(AUDIO_STORE)) {
         db.createObjectStore(AUDIO_STORE, { keyPath: 'id' });
+      }
+      // Phase 3 stores. Creating them during the same upgrade leaves every existing song intact, so
+      // a version-1 database becomes a version-2 one without a migration pass.
+      if (!db.objectStoreNames.contains(SCORES_STORE)) {
+        db.createObjectStore(SCORES_STORE, { keyPath: 'key' });
+      }
+      if (!db.objectStoreNames.contains(SCORE_ATTEMPTS_STORE)) {
+        db.createObjectStore(SCORE_ATTEMPTS_STORE, { keyPath: 'key' });
       }
     };
     const db = await requestToPromise(request as IDBRequest<IDBDatabase>);
@@ -135,6 +154,8 @@ export class IndexedDbSongStore implements SongStore {
     tx.objectStore(SONGS_STORE).delete(id);
     tx.objectStore(AUDIO_STORE).delete(id);
     await transactionDone(tx);
+    // Scores would otherwise be orphaned: unreachable, and still counted in the player's history.
+    await this.scores.removeSong(id);
   }
 
   async count(): Promise<number> {
@@ -152,6 +173,7 @@ export class IndexedDbSongStore implements SongStore {
 export class MemorySongStore implements SongStore {
   readonly kind = 'memory' as const;
   readonly persistent = false;
+  readonly scores: ScoreStore = new MemoryScoreStore();
   private readonly records = new Map<string, string>();
   private readonly audio = new Map<string, StoredAudioBlob>();
 
@@ -183,6 +205,7 @@ export class MemorySongStore implements SongStore {
   async remove(id: string): Promise<void> {
     this.records.delete(id);
     this.audio.delete(id);
+    await this.scores.removeSong(id);
   }
 
   async count(): Promise<number> {

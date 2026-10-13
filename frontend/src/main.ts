@@ -10,7 +10,7 @@ import './styles.css';
 import { GameApp } from './ui/GameApp';
 import { assertDomContract } from './ui/dom';
 
-const VERSION = '0.2.0-phase2';
+const VERSION = '0.3.1-phase3.1';
 
 interface SevenKeysDebugApi {
   version: string;
@@ -20,6 +20,10 @@ interface SevenKeysDebugApi {
   layout: () => Record<string, unknown>;
   /** Phase 2 analysis/diagnostics numbers for the currently loaded song. */
   diagnostics: () => unknown;
+  /** Difficulties of the current song and which one is loaded (phase 3). */
+  difficulties: () => Record<string, unknown>;
+  /** Switch difficulty of the current song (no re-analysis). */
+  setDifficulty: (difficulty: string) => Promise<void>;
   /** Open the import panel (same as the ready-panel button). */
   openImport: () => void;
   /** QA hook: import audio from a URL as if it had been selected locally. */
@@ -70,6 +74,14 @@ async function main(): Promise<void> {
       };
     },
     diagnostics: () => app.debugState()['diagnostics'] ?? null,
+    difficulties: () => (app.debugState()['difficulties'] as Record<string, unknown>) ?? {},
+    setDifficulty: async (difficulty: string) => {
+      const known = app.availableDifficulties;
+      if (difficulty !== 'easy' && difficulty !== 'normal' && difficulty !== 'hard') {
+        throw new Error(`unknown difficulty: ${difficulty} (available: ${known.join(', ') || 'none'})`);
+      }
+      await app.setDifficulty(difficulty);
+    },
     openImport: () => app.openImportPanel(),
     importUrl: (url: string, name?: string) => app.importFromUrl(url, name),
     start: () => void app.start(),

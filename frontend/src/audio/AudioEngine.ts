@@ -127,6 +127,14 @@ export class WebAudioEngine implements AudioSourceTimeline, SongClock {
     return this.buffer !== null;
   }
 
+  /**
+   * The decoded song currently loaded. Exposed so a difficulty switch can reuse the decode instead
+   * of asking the library for the bytes again: switching charts must never re-decode the audio.
+   */
+  get currentBuffer(): AudioBuffer | null {
+    return this.buffer;
+  }
+
   loadBuffer(buffer: AudioBuffer): void {
     this.buffer = buffer;
     this.stopSource();

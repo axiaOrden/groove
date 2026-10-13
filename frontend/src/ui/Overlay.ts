@@ -8,6 +8,7 @@
 
 import type { GameSettings } from '../game/GameConfig';
 import { NOTE_SPEED_LIMITS, OFFSET_LIMITS } from '../game/GameConfig';
+import { LANE_PALETTES, lanePalette } from '../renderer/Layout';
 import type { SettingsStore } from '../storage/SettingsStore';
 import { el, setHidden, setText } from './dom';
 
@@ -43,6 +44,7 @@ export class Overlay {
   private readonly speedValue = el('setting-speed-value');
   private readonly volumeInput = el<HTMLInputElement>('setting-volume');
   private readonly volumeValue = el('setting-volume-value');
+  private readonly paletteSelect = el<HTMLSelectElement>('setting-palette');
   private current: PanelName = 'loading';
   private errorMessage: string | null = null;
 
@@ -56,6 +58,16 @@ export class Overlay {
     this.speedInput.min = String(NOTE_SPEED_LIMITS.min);
     this.speedInput.max = String(NOTE_SPEED_LIMITS.max);
     this.speedInput.step = String(NOTE_SPEED_LIMITS.step);
+
+    // The lane palette is a choice between named themes, so it is a select built from the single
+    // catalogue in `renderer/Layout` — there is no second list of names or colours to drift.
+    this.paletteSelect.replaceChildren();
+    for (const palette of LANE_PALETTES) {
+      const option = document.createElement('option');
+      option.value = palette.id;
+      option.textContent = palette.name;
+      this.paletteSelect.appendChild(option);
+    }
 
     this.bindSettings();
 
@@ -95,6 +107,7 @@ export class Overlay {
     this.offsetInput.value = String(settings.globalOffsetMs);
     this.speedInput.value = String(settings.noteSpeed);
     this.volumeInput.value = String(Math.round(settings.volume * 100));
+    this.paletteSelect.value = lanePalette(settings.lanePalette).id;
     setText(this.offsetValue, `${settings.globalOffsetMs > 0 ? '+' : ''}${settings.globalOffsetMs} ms`);
     setText(this.speedValue, `${settings.noteSpeed.toFixed(1)}×`);
     setText(this.volumeValue, `${Math.round(settings.volume * 100)}%`);
@@ -123,6 +136,11 @@ export class Overlay {
     });
     this.volumeInput.addEventListener('input', () => {
       const next = this.settings.update({ volume: Number(this.volumeInput.value) / 100 });
+      this.syncSettingsInputs();
+      this.callbacks.onSettingsChange(next);
+    });
+    this.paletteSelect.addEventListener('change', () => {
+      const next = this.settings.update({ lanePalette: this.paletteSelect.value });
       this.syncSettingsInputs();
       this.callbacks.onSettingsChange(next);
     });

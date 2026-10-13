@@ -17,9 +17,13 @@
  * Laravel API (phase 5).
  */
 
-export const BEATMAP_SCHEMA_VERSION = 1;
+export const BEATMAP_SCHEMA_VERSION = 2;
 
+/** Maximum lane count the game can render (hard: A S D SPACE J K L). */
 export const LANE_COUNT = 7;
+
+/** Lane counts the difficulty table generates (easy, normal, hard). */
+export const MIN_LANE_COUNT = 1;
 
 export type Difficulty = 'easy' | 'normal' | 'hard' | 'expert';
 
@@ -49,6 +53,17 @@ export interface Beatmap {
   artist?: string;
   charter?: string;
   difficulty: Difficulty;
+  /**
+   * Lanes this chart renders, left to right. Phase 3 made this per-chart (4, 5 or 7); charts
+   * written before it are seven lanes, which is also the default when the field is absent, so
+   * every old record keeps playing unchanged.
+   */
+  laneCount?: number;
+  /**
+   * Key label per lane (`['A','S','K','L']`). Display and diagnostics metadata: the authoritative
+   * mapping from key code to lane lives in `game/KeyLayout`, driven by the difficulty.
+   */
+  keyLabels?: string[];
   /** Beats per minute used for the beat grid / editor snapping. */
   bpm: number;
   /** Per-chart offset in ms, added to every note time (both visuals and judgment). */
@@ -56,7 +71,21 @@ export interface Beatmap {
   generator: ChartGeneratorInfo;
   /** Optional hint; the authoritative duration is the decoded audio buffer. */
   durationMs?: number;
+  /** Estimated notes per second, computed by the generator (diagnostics + difficulty cards). */
+  noteDensity?: number;
+  /**
+   * Theoretical maximum score for this chart at its difficulty weight, with every unit PERFECT at
+   * the capped combo multiplier. See `chart/ScoreModel.ts` for the formula.
+   */
+  maxScore?: number;
   notes: ChartNote[];
+}
+
+/** Lanes a chart renders. Absent means seven, i.e. a pre-phase-3 chart. */
+export function lanesOf(chart: Pick<Beatmap, 'laneCount'>): number {
+  const lanes = chart.laneCount;
+  if (!Number.isInteger(lanes) || (lanes ?? 0) < 1) return LANE_COUNT;
+  return Math.min(LANE_COUNT, lanes as number);
 }
 
 /** Inclusive upper bounds of each judgment window, in ms of absolute timing error. */

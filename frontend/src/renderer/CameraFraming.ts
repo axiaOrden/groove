@@ -69,6 +69,13 @@ export interface FramingInput {
   insets?: Partial<SafeInsets>;
   /** True when the coarse-pointer (touch) layout is active. */
   touchLayout: boolean;
+  /**
+   * Lanes to spread across the usable width (default 7). The solved mobile camera keeps hard A —
+   * "the lane columns span `LANE_SPREAD` of the usable width" — for *any* count, so a four-lane
+   * Easy chart gets four wider columns rather than four narrow ones in a seven-wide road. The
+   * touch layer is derived from the same projection, so its columns follow automatically.
+   */
+  laneCount?: number;
 }
 
 export interface CameraPose {
@@ -158,7 +165,12 @@ export interface PoseMetrics {
  * Screen-space projection of one camera pose. Shared by `computeFraming`, the touch layer and
  * the tests, which check it against three.js's projection matrix.
  */
-export function poseMetrics(pose: CameraPose, viewportWidth: number, viewportHeight: number): PoseMetrics {
+export function poseMetrics(
+  pose: CameraPose,
+  viewportWidth: number,
+  viewportHeight: number,
+  laneCount: number = LANE_COUNT,
+): PoseMetrics {
   const h = pose.position.y;
   const u = pose.position.z;
   const camX = pose.position.x;
@@ -175,9 +187,10 @@ export function poseMetrics(pose: CameraPose, viewportWidth: number, viewportHei
     return viewportHeight / 2 + (focalPx * h * (k + z)) / (axisLength * depth);
   };
 
+  const lanes = Math.max(1, Math.min(LANE_COUNT, Math.round(laneCount) || LANE_COUNT));
   const laneCentersPx: number[] = [];
-  for (let lane = 0; lane < LANE_COUNT; lane += 1) {
-    laneCentersPx.push(viewportWidth / 2 + (focalPx * (laneToX(lane) - camX)) / depthHit);
+  for (let lane = 0; lane < lanes; lane += 1) {
+    laneCentersPx.push(viewportWidth / 2 + (focalPx * (laneToX(lane, lanes) - camX)) / depthHit);
   }
 
   return {
@@ -234,6 +247,7 @@ interface MobileGeometry {
   width: number;
   height: number;
   usable: Framing['usable'];
+  laneCount: number;
   /** `f / depthHit`, i.e. px of lane spacing per world unit of depth (hard A). */
   spread: number;
   /** Fixed `k`, from hard A and hard B with the desktop view steepness. */
@@ -242,15 +256,21 @@ interface MobileGeometry {
   axisScale: number;
 }
 
-function mobileGeometry(width: number, height: number, usable: Framing['usable']): MobileGeometry {
+function mobileGeometry(
+  width: number,
+  height: number,
+  usable: Framing['usable'],
+  laneCount: number,
+): MobileGeometry {
   const q = VIEW_STEEPNESS;
   const axisScale = Math.hypot(1, 1 / q);
-  const spread = (LANE_SPREAD * usable.width) / (LANE_COUNT * LANE_PITCH);
+  // Hard A spreads the lanes the chart actually uses, so four lanes get four wide columns.
+  const spread = (LANE_SPREAD * usable.width) / (laneCount * LANE_PITCH);
   const deltaY = usable.top + HIT_LINE_FRACTION * usable.height - height / 2;
   // screenY(0) = H/2 + S h k / L with L = h axisScale  =>  k = deltaY axisScale / S, and hard B
   // then holds exactly for every camera distance, which is what makes the hit line stable
   // while the read time is tuned.
-  return { width, height, usable, spread, k: (deltaY * axisScale) / spread, axisScale };
+  return { width, height, usable, laneCount, spread, k: (deltaY * axisScale) / spread, axisScale };
 }
 
 /** Pose of the solved camera family for one candidate distance. */
@@ -304,12 +324,17 @@ function legibleDistanceRange(geometry: MobileGeometry): { min: number; max: num
  * that the spawn plane sits as close as possible to the top of the usable area (soft C),
  * inside the legible distance window (limit D).
  */
-function solveMobilePose(width: number, height: number, usable: Framing['usable']): { pose: CameraPose; clamped: boolean } {
-  const geometry = mobileGeometry(width, height, usable);
+function solveMobilePose(
+  width: number,
+  height: number,
+  usable: Framing['usable'],
+  laneCount: number,
+): { pose: CameraPose; clamped: boolean } {
+  const geometry = mobileGeometry(width, height, usable, laneCount);
   const range = legibleDistanceRange(geometry);
 
   const distanceForSpawnAtTop = (u: number): number =>
-    poseMetrics(poseAtDistance(u, geometry), width, height).screenYForZ(-ROAD_LENGTH) - usable.top;
+    poseMetrics(poseAtDistance(u, geometry), width, height, laneCount).screenYForZ(-ROAD_LENGTH) - usable.top;
 
   // `spawnOvershoot` is > 0 while the spawn plane is still below the top edge and < 0 once it
   // is above it, and it decreases as the camera moves back. The aim is the *closest* camera
@@ -370,13 +395,14 @@ export function computeFraming(input: FramingInput): Framing {
   const viewportWidth = Math.max(MIN_VIEWPORT_PX, Math.round(input.viewportWidth) || MIN_VIEWPORT_PX);
   const viewportHeight = Math.max(MIN_VIEWPORT_PX, Math.round(input.viewportHeight) || MIN_VIEWPORT_PX);
   const usable = usableRect(viewportWidth, viewportHeight, normalizeInsets(input.insets));
+  const laneCount = Math.max(1, Math.min(LANE_COUNT, Math.round(input.laneCount ?? LANE_COUNT) || LANE_COUNT));
 
   let pose: CameraPose;
   let mode: FramingMode;
   let clamped = false;
 
   if (input.touchLayout) {
-    const solved = solveMobilePose(viewportWidth, viewportHeight, usable);
+    const solved = solveMobilePose(viewportWidth, viewportHeight, usable, laneCount);
     pose = solved.pose;
     clamped = solved.clamped;
     mode = clamped ? 'mobile-clamped' : 'mobile';
@@ -385,7 +411,7 @@ export function computeFraming(input: FramingInput): Framing {
     mode = 'desktop';
   }
 
-  const metrics = poseMetrics(pose, viewportWidth, viewportHeight);
+  const metrics = poseMetrics(pose, viewportWidth, viewportHeight, laneCount);
   return {
     mode,
     camera: pose,

@@ -14,12 +14,18 @@ class FakeClock implements SongClock {
   }
 }
 
+/**
+ * The engine fixture is a seven-lane chart, so it is a **Hard** chart and every score below carries
+ * Hard's ×2.0 difficulty weight (phase 3). `ScoreModel` has the formula; the comments on the score
+ * assertions spell out the arithmetic so a change in either the weight or the combo step is visible.
+ */
 function chartOf(notes: ChartNote[], offsetMs = 0): Beatmap {
   return prepareBeatmap({
     schemaVersion: BEATMAP_SCHEMA_VERSION,
     songId: 'unit-test',
     title: 'Unit Test',
-    difficulty: 'normal',
+    difficulty: 'hard',
+    laneCount: 7,
     bpm: 120,
     offsetMs,
     generator: { name: 'test', version: '1.0.0', seed: 7 },
@@ -61,7 +67,7 @@ describe('tap judgment through the engine', () => {
     expect(judgment?.errorMs).toBe(0);
     expect(judgment?.combo).toBe(1);
     expect(judgment?.noteStatus).toBe('hit');
-    expect(engine.scoreSnapshot.score).toBe(303); // 300 * (1 + 0.01 * combo 1)
+    expect(engine.scoreSnapshot.score).toBe(606); // 300 * (1 + 0.01 * combo 1) * hard 2.0
     expect(engine.scoreSnapshot.maxCombo).toBe(1);
     expect(engine.pendingNotes).toBe(0);
     expect(engine.notes[0]!.status).toBe('hit');
@@ -203,7 +209,7 @@ describe('holds', () => {
     expect(events.some((event) => event.type === 'hold-complete')).toBe(true);
     expect(engine.notes[0]!.status).toBe('completed');
     expect(engine.scoreSnapshot.holdCompleted).toBe(1);
-    expect(engine.scoreSnapshot.score).toBe(606); // head 303 + tail 303
+    expect(engine.scoreSnapshot.score).toBe(1212); // head 606 + tail 606 (hard weight applied twice)
     expect(engine.scoreSnapshot.combo).toBe(1); // the tail does not add a second combo step
     expect(engine.pendingNotes).toBe(0);
   });
@@ -214,7 +220,7 @@ describe('holds', () => {
     const events = engine.releaseLane(4, 2750); // tail is at 2800, grace is 100 ms
     expect(events.some((event) => event.type === 'hold-complete')).toBe(true);
     expect(engine.notes[0]!.status).toBe('completed');
-    expect(engine.scoreSnapshot.score).toBe(606);
+    expect(engine.scoreSnapshot.score).toBe(1212);
   });
 
   it('breaks the hold and resets combo on an early release, keeping the head score', () => {
@@ -226,7 +232,7 @@ describe('holds', () => {
     expect(engine.notes[0]!.status).toBe('broken');
     expect(engine.notes[0]!.releasedEarly).toBe(true);
     expect(engine.scoreSnapshot.holdBroken).toBe(1);
-    expect(engine.scoreSnapshot.score).toBe(303);
+    expect(engine.scoreSnapshot.score).toBe(606); // the head's award only
     expect(engine.scoreSnapshot.combo).toBe(0);
     expect(engine.pendingNotes).toBe(0);
     expect(engine.scoreSnapshot.judgedNotes).toBe(1);

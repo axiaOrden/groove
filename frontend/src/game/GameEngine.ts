@@ -19,6 +19,8 @@
  */
 
 import type { Beatmap, TimingWindows } from '../chart/ChartTypes';
+import { lanesOf } from '../chart/ChartTypes';
+import { difficultyProfileOf, type ChartDifficulty } from '../chart/Difficulty';
 import type { JudgmentType, ScoreRules } from './GameConfig';
 import { DEFAULT_SCORE_RULES, DEFAULT_TIMING_WINDOWS } from './GameConfig';
 import type { RuntimeNote, NoteStatus } from './JudgmentEngine';
@@ -87,6 +89,13 @@ export class GameEngine {
   private readonly pressed: boolean[];
   private readonly events: GameEvent[] = [];
   private readonly chartEndMsValue: number;
+  /**
+   * Lanes this run has, from the chart: four, five or seven. The lane arrays are sized to it, so a
+   * four-lane chart costs a quarter less per-frame lane scanning than a seven-lane one and — more
+   * importantly — a note can never be judged on a lane the player has no key for.
+   */
+  private readonly laneCountValue: number;
+  private readonly difficulty: ChartDifficulty;
   private globalOffsetMs: number;
   private phaseValue: GamePhase = 'ready';
   private lastSongTimeMs = 0;
@@ -100,19 +109,21 @@ export class GameEngine {
     this.windows = options.windows ?? DEFAULT_TIMING_WINDOWS;
     this.rules = options.rules ?? DEFAULT_SCORE_RULES;
     this.globalOffsetMs = options.globalOffsetMs ?? 0;
-    this.score = new ScoreManager(this.rules);
+    this.laneCountValue = lanesOf(this.chart);
+    this.difficulty = difficultyProfileOf(this.chart.difficulty).id;
+    this.score = new ScoreManager(this.rules, { difficulty: this.difficulty });
 
     this.notes = createRuntimeNotes(this.chart.notes, {
       chartOffsetMs: this.chart.offsetMs,
       rules: this.rules,
     });
 
-    this.lanes = Array.from({ length: 7 }, () => []);
+    this.lanes = Array.from({ length: this.laneCountValue }, () => []);
     for (const note of this.notes) {
       this.lanes[note.lane]!.push(note);
     }
-    this.laneStart = new Array<number>(7).fill(0);
-    this.pressed = new Array<boolean>(7).fill(false);
+    this.laneStart = new Array<number>(this.laneCountValue).fill(0);
+    this.pressed = new Array<boolean>(this.laneCountValue).fill(false);
     this.pendingValue = this.notes.length;
     this.chartEndMsValue = this.notes.reduce((max, note) => Math.max(max, note.endTimeMs), 0);
   }
@@ -141,6 +152,15 @@ export class GameEngine {
 
   get totalNotes(): number {
     return this.notes.length;
+  }
+
+  /** Lanes this chart renders (4, 5 or 7). The renderer and the input map follow it. */
+  get laneCount(): number {
+    return this.laneCountValue;
+  }
+
+  get chartDifficulty(): ChartDifficulty {
+    return this.difficulty;
   }
 
   /** Notes that still need a head judgment, plus holds that are being held. */
@@ -180,6 +200,10 @@ export class GameEngine {
    */
   pressLane(lane: number, songTimeMs: number): GameEvent[] {
     if (this.phaseValue === 'paused' || this.phaseValue === 'finished') return this.drainEvents();
+    // A lane the chart does not have cannot judge anything, and it is not the player's mistake
+    // either: phase 3 charts have four, five or seven lanes, so a lane beyond this chart's count is
+    // ignored rather than counted as a stray press.
+    if (!Number.isInteger(lane) || lane < 0 || lane >= this.laneCountValue) return this.drainEvents();
     if (this.pressed[lane]) {
       // Duplicate/auto-repeat style event while the key is already down: ignore entirely.
       return this.drainEvents();
@@ -199,6 +223,7 @@ export class GameEngine {
     const award = this.score.awardHead(judgment, 1);
     target.headJudgment = judgment;
     target.headErrorMs = errorMs;
+    target.headCombo = award.combo;
 
     if (target.type === 'tap') {
       target.status = 'hit';
@@ -356,11 +381,20 @@ export class GameEngine {
     this.finished = false;
     this.lastSongTimeMs = 0;
     this.lastJudgeTimeMs = 0;
-    this.score = new ScoreManager(this.rules);
+    this.score = new ScoreManager(this.rules, { difficulty: this.difficulty });
   }
 
   getResults(): PlayResults {
-    return this.score.results(this.notes.length, this.lastSongTimeMs);
+    // `totalUnits` counts a hold as two notes (the chart's note *mix*); the chart's notes go along
+    // too, because the theoretical maximum is a flawless run of this exact note list — see
+    // `perfectRunScore`, which is what makes the score/max percentage reach 100 %.
+    let totalUnits = 0;
+    for (const note of this.notes) totalUnits += note.weight;
+    return this.score.results(this.notes.length, this.lastSongTimeMs, {
+      notes: this.chart.notes,
+      totalUnits,
+      difficulty: this.difficulty,
+    });
   }
 
   // ---------------------------------------------------------------- internal --
@@ -413,7 +447,13 @@ export class GameEngine {
     note.status = 'completed';
     this.holding.delete(note);
     this.pendingValue -= 1;
-    const points = this.score.awardHoldTail(note.headJudgment ?? 'perfect', this.rules.holdWeight - 1);
+    // The tail is scored at the multiplier the head was awarded at, so a hold is worth the same
+    // whether it is held to the tail or released inside the grace window (`chart/ScoreModel`).
+    const points = this.score.awardHoldTail(
+      note.headJudgment ?? 'perfect',
+      this.rules.holdWeight - 1,
+      note.headCombo ?? undefined,
+    );
     this.events.push({ type: 'hold-complete', lane, noteIndex: note.index, points });
   }
 

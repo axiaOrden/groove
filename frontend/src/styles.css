@@ -507,6 +507,29 @@ kbd {
   accent-color: var(--accent);
 }
 
+/*
+  The lane-palette picker (phase 3.1). Styled like the other settings rows so it reads as one more
+  player preference, not as a new control. The selected option's colour swatches are drawn from the
+  palette definition in src/renderer/Layout.ts (see `LANE_PALETTES`), so a theme change is visible
+  in the picker itself.
+*/
+.setting select {
+  width: 100%;
+  padding: 7px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: rgba(5, 8, 16, 0.85);
+  color: var(--text);
+  font-family: inherit;
+  font-size: clamp(12px, 0.9vw, 14px);
+  accent-color: var(--accent);
+}
+
+.setting select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
 .setting-hint {
   display: block;
   margin-top: 7px;
@@ -1177,6 +1200,120 @@ html[data-touch='true'] .panel-actions {
   display: none;
 }
 
+/* ---- difficulty selector (phase 3) ------------------------------------- */
+
+.difficulty-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.difficulty-card {
+  display: grid;
+  gap: 7px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #080d1a8c;
+  padding: 10px 12px;
+}
+
+.difficulty-card[data-available='false'] {
+  opacity: 0.72;
+  border-style: dashed;
+}
+
+.difficulty-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.difficulty-head strong {
+  font-size: clamp(12px, 0.95vw, 15px);
+}
+
+.difficulty-keys {
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: clamp(10px, 0.78vw, 12px);
+  white-space: nowrap;
+}
+
+.difficulty-summary {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: clamp(10px, 0.82vw, 12.5px);
+  line-height: 1.35;
+}
+
+.difficulty-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(84px, 1fr));
+  gap: 5px 10px;
+  margin: 0;
+}
+
+.difficulty-stats div {
+  display: grid;
+  gap: 1px;
+}
+
+.difficulty-stats dt {
+  color: var(--text-dim);
+  font-size: clamp(9px, 0.72vw, 11px);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.difficulty-stats dd {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: clamp(11px, 0.86vw, 13px);
+}
+
+.difficulty-best {
+  color: var(--text-dim);
+  font-size: clamp(10px, 0.8vw, 12px);
+  font-family: var(--mono);
+}
+
+.difficulty-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.difficulty-note {
+  margin-top: 6px;
+}
+
+.difficulty-note[hidden] {
+  display: none;
+}
+
+.pause-difficulty {
+  display: grid;
+  gap: 6px;
+  margin: 4px 0 10px;
+}
+
+.pause-difficulty[hidden] {
+  display: none;
+}
+
+.pause-difficulty-options {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.pause-difficulty-options button[data-active='true'] {
+  border-color: var(--accent, #7dd3fc);
+  color: var(--text, #e8eefc);
+}
+
 /* ---- diagnostics (inside the import panel, phase 2.1) ------------------- */
 
 .diag {
@@ -1385,6 +1522,10 @@ html[data-touch=true] .drop-zone {
 
 html[data-touch=true] .import-stats {
   grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+}
+
+html[data-touch=true] .difficulty-grid {
+  grid-template-columns: 1fr;
 }
 
 html[data-touch=true] .diag {

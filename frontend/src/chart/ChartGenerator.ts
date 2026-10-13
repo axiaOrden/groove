@@ -67,17 +67,44 @@
  * which is a lead stab, a vocal chop or a snare ghost note depending on the track. What the mapping
  * does guarantee is that the *shape* of the music is preserved: accents go to the centre key,
  * register spreads left to right, and syncopation goes to the inner keys.
+ *
+ * -------------------------------------------------------------------------------------------------
+ * Phase 3 — one analysis, three difficulties
+ *
+ * The generator is now **lane-count agnostic**. Everything that used to be a seven-lane constant is
+ * a `LaneProfile` resolved from the chart's lane count (4 = Easy, 5 = Normal, 7 = Hard):
+ *
+ *   - the role ladders, the band fallbacks and the two hand groups come from the profile, so a
+ *     four-lane chart sends accents to S/K instead of to a SPACE that does not exist;
+ *   - the density, gap, chord and hold budgets come from the difficulty's `generation` block, which
+ *     is what makes Easy genuinely sparser rather than Hard with lanes hidden;
+ *   - chords have a **size budget** (`maxChordSize`: 2 / 3 / 4) instead of being two-note by
+ *     construction; a chord always alternates hands, so even a four-note accent stays playable.
+ *
+ * Nothing else about the pipeline changes: slots, onset reinforcement, selection, roles, the lane
+ * walk and validation are the same stages, so a seven-lane chart generated with the hard profile
+ * behaves exactly as it did in phase 2.1 (only the four-note chord size is new).
+ *
+ * `GENERATOR_VERSION` was bumped because the output of a given seed can differ from phase 2.1's.
  */
 
-import type { Beatmap, ChartNote, NoteType } from './ChartTypes';
-import { BEATMAP_SCHEMA_VERSION, LANE_COUNT, sortNotes } from './ChartTypes';
+import type { Beatmap, ChartNote, Difficulty } from './ChartTypes';
+import { BEATMAP_SCHEMA_VERSION, LANE_COUNT, lanesOf, sortNotes } from './ChartTypes';
 import { validateBeatmap, type ValidationResult } from './ChartValidator';
 import type { AnalysisSummary, EnergyProfile, OnsetBand, OnsetEvent, TimeRange } from '../analysis/types';
 import { intensityAtBeat } from '../analysis/types';
 import { BEATS_PER_BAR, beatToleranceMs, signedOffsetMs } from '../analysis/BeatGrid';
+import { keyLabelsFor } from './Difficulty';
+import { laneProfileFor, type CandidateRole, type LaneProfile } from './LaneProfile';
+import { maxTheoreticalScoreOf } from './ScoreModel';
 
 export const GENERATOR_NAME = 'seven-keys-analysis-v1';
-export const GENERATOR_VERSION = '1.0.0';
+/**
+ * Bumped when a given (analysis, seed) can produce different notes than the previous version.
+ * 2.1.0: Hard's chord size returns to the phase 2.1 baseline of two notes, so a seven-key chart is
+ * byte-identical to the 1.0.0 generator again for the same seed (2.0.0 had raised it to four).
+ */
+export const GENERATOR_VERSION = '2.1.0';
 
 export interface GenerateOptions {
   /** Seed for every random decision. Same seed + same analysis ⇒ same chart. */
@@ -95,7 +122,8 @@ export interface GenerateOptions {
   minNoteGapMs?: number;
   /** Minimum distance between two notes *in the same lane*, in ms. */
   minLaneGapMs?: number;
-  /** Maximum fraction of notes that may be chords (two simultaneous notes). */
+  /** Maximum fraction of notes that may be chords. With `maxChordSize` this is a budget in chord
+   * *notes*, so raising the chord size does not also silently raise the chord share. */
   maxChordRatio?: number;
   /** Maximum fraction of notes that may be holds. */
   maxHoldRatio?: number;
@@ -104,8 +132,22 @@ export interface GenerateOptions {
    * every beat the key would stop meaning "this one matters".
    */
   maxSpaceRatio?: number;
+  /**
+   * Maximum simultaneous notes in one chord. 2 = two-note chords at most (Easy), 3 for Normal and
+   * 4 for Hard. Members always alternate hands, so this is a musical budget rather than a limit on
+   * how many fingers a player has.
+   */
+  maxChordSize?: number;
   /** Notes closer than this to a detected onset are considered aligned with it (metrics only). */
   alignToleranceMs?: number;
+  /** Lanes the chart renders. 4 = easy, 5 = normal, 7 = hard; defaults to `LANE_COUNT` (7). */
+  laneCount?: number;
+  /** Difficulty label written into the chart. */
+  difficulty?: Difficulty;
+  /** Score multiplier for the chart's `maxScore` metadata (see `chart/ScoreModel.ts`). */
+  difficultyWeight?: number;
+  /** Explicit lane profile (tests); otherwise derived from `laneCount` via `laneProfileFor`. */
+  laneProfile?: LaneProfile;
 }
 
 export interface ChartStats {
@@ -137,6 +179,12 @@ export interface ChartStats {
   maxGapMs: number;
   meanGapMs: number;
   sectionsSkipped: number;
+  /** Lanes this chart renders (4, 5 or 7). */
+  laneCount: number;
+  /** Notes sharing an instant at their densest point: 1 for a tap-only chart, `maxChordSize` at most. */
+  maxSimultaneous: number;
+  /** Chord *notes* (not chord events), the numerator of `chordRatio`. */
+  chordNoteCount: number;
   /** Notes on the SPACE lane, and their share of the chart (phase 2.1 role mapping). */
   spaceCount: number;
   spaceRatio: number;
@@ -165,68 +213,36 @@ export interface GenerationResult {
   warnings: string[];
 }
 
-const DEFAULTS: Required<Omit<GenerateOptions, 'songId' | 'title' | 'artist' | 'charter' | 'durationMs'>> = {
+/**
+ * Resolved generator settings. `laneProfile` is kept out: it is passed explicitly, so the lane
+ * tables are resolved once per call instead of being re-derived in every helper.
+ */
+type GeneratorSettings = Required<
+  Omit<GenerateOptions, 'songId' | 'title' | 'artist' | 'charter' | 'durationMs' | 'laneProfile'>
+>;
+
+const DEFAULTS: GeneratorSettings = {
   seed: 1,
   targetNotesPerSecond: 3.2,
   maxNotesPerSecond: 9,
   minNoteGapMs: 90,
   minLaneGapMs: 150,
   maxChordRatio: 0.12,
+  maxChordSize: 2,
   maxHoldRatio: 0.15,
   maxSpaceRatio: 0.34,
   alignToleranceMs: 60,
+  laneCount: LANE_COUNT,
+  // Both are overridden by the difficulty profiles (see `chart/Difficulty.ts`); the defaults exist
+  // so a bare `generateChart(analysis, { seed, songId, title })` stays a seven-lane chart, exactly
+  // as it did before phase 3.
+  difficulty: 'normal',
+  difficultyWeight: 1,
 };
 
-/**
- * Lanes a band's energy is allowed to land in, used as the fallback when a role's own pool is
- * blocked: bass left, snare/vocal centre, lead right. A broadband hit is allowed anywhere, which is
- * also how a bass-only track still reaches the right-hand lanes over a longer chart.
- */
-const BAND_LANES: Record<OnsetBand, readonly number[]> = {
-  low: [0, 1, 2],
-  mid: [2, 3, 4],
-  high: [4, 5, 6],
-  broad: [0, 1, 2, 3, 4, 5, 6],
-};
-
-const LEFT_HAND = [0, 1, 2];
-const RIGHT_HAND = [4, 5, 6];
-const CENTER = 3;
-
-/**
- * What a detected event *is*, as far as measurable features can say. See the file header: these are
- * heuristics, not instrument recognition.
- */
-export type CandidateRole =
-  | 'downbeat'
-  | 'kick'
-  | 'low'
-  | 'high'
-  | 'supporting'
-  | 'melodic'
-  | 'syncopation'
-  | 'beat';
-
-/**
- * The lane each role belongs to, in preference order.
- *
- * The first entry is the *meaning* of the role (SPACE for the accented beat, A for low percussion,
- * …); the rest is a fallback ladder used when the first lane is still inside its minimum gap. The
- * ladders deliberately start on the opposite hand for percussion (a low hit that cannot use A falls
- * to the middle rather than to the far right), so a chart does not jump across the keyboard.
- */
-const ROLE_LANES: Record<CandidateRole, readonly number[]> = {
-  downbeat: [3, 2, 4, 1, 5, 0, 6],
-  kick: [3, 2, 4, 0, 6, 1, 5],
-  low: [0, 1, 2, 3, 4, 5, 6],
-  high: [6, 5, 4, 3, 2, 1, 0],
-  supporting: [1, 5, 2, 4, 0, 6, 3],
-  melodic: [2, 4, 1, 5, 0, 6, 3],
-  syncopation: [4, 2, 5, 1, 6, 0, 3],
-  // A grid beat with nothing happening on it is a weak claim: it prefers the supporting keys and
-  // never claims SPACE, which is reserved for accents.
-  beat: [1, 5, 2, 4, 0, 6],
-};
+// `CandidateRole` and the lane tables live in `chart/LaneProfile.ts` now, because the mapping
+// depends on the lane count. Re-exported so the diagnostics panel keeps its import path.
+export type { CandidateRole };
 
 const EMPTY_ROLE_COUNTS: Record<CandidateRole, number> = {
   downbeat: 0,
@@ -280,6 +296,8 @@ export function generateChart(analysis: AnalysisSummary, options: GenerateOption
     throw new Error('analysis has no usable beat grid; cannot generate a chart');
   }
   const settings = { ...DEFAULTS, ...options };
+  const profile = options.laneProfile ?? laneProfileFor(settings.laneCount);
+  settings.laneCount = profile.laneCount;
   const random = seededRandom(settings.seed);
   const warnings: string[] = [];
   const drop: DropCounters = {
@@ -292,15 +310,15 @@ export function generateChart(analysis: AnalysisSummary, options: GenerateOption
 
   const candidates = buildCandidates(analysis, settings, drop);
   const selected = selectCandidates(candidates, analysis, settings, drop, warnings);
-  const { notes, stats: laneStats } = assignLanes(selected, analysis, settings, random, drop, warnings);
+  const { notes, stats: laneStats } = assignLanes(selected, analysis, settings, profile, random, drop, warnings);
 
-  const chart = buildBeatmap(notes, analysis, settings);
+  const chart = buildBeatmap(notes, analysis, settings, profile);
   const validation = validateBeatmap(chart, { maxNotesPerSecond: settings.maxNotesPerSecond });
   if (!validation.ok) {
     warnings.push(`generated chart failed validation: ${validation.errors.map((e) => e.code).join(', ')}`);
   }
 
-  const stats = summarize(chart, analysis, settings, laneStats, drop);
+  const stats = summarize(chart, analysis, settings, laneStats, drop, profile);
   return { chart, stats, validation, warnings };
 }
 
@@ -402,7 +420,7 @@ function classifyOnset(
 /** Build the slot skeleton from the beat grid and reinforce it with detected onsets. */
 function buildCandidates(
   analysis: AnalysisSummary,
-  settings: Required<Omit<GenerateOptions, 'songId' | 'title' | 'artist' | 'charter' | 'durationMs'>>,
+  settings: GeneratorSettings,
   drop: DropCounters,
 ): Candidate[] {
   const beats = analysis.beats;
@@ -531,7 +549,7 @@ function beatDensity(energy: EnergyProfile, beatIndex: number): number {
 function selectCandidates(
   candidates: Candidate[],
   analysis: AnalysisSummary,
-  settings: Required<Omit<GenerateOptions, 'songId' | 'title' | 'artist' | 'charter' | 'durationMs'>>,
+  settings: GeneratorSettings,
   drop: DropCounters,
   warnings: string[],
 ): Candidate[] {
@@ -591,7 +609,7 @@ function selectCandidates(
 /** Notes allowed in the second around a candidate: intensity-driven, capped at the hard ceiling. */
 function densityBudget(
   analysis: AnalysisSummary,
-  settings: Required<Omit<GenerateOptions, 'songId' | 'title' | 'artist' | 'charter' | 'durationMs'>>,
+  settings: GeneratorSettings,
   candidate: Candidate,
 ): number {
   const intensity = candidate.beatIndex >= 0 ? intensityAtBeat(analysis.energy, candidate.beatIndex) : 0.6;
@@ -608,7 +626,10 @@ interface LaneState {
   /** How often each lane has been used, so the walk spreads over the keyboard instead of hovering. */
   usage: number[];
   freeSince: number[];
+  /** Chord *events*, for the diagnostics readout. */
   chordCount: number;
+  /** Chord *notes*, the quantity the budget is actually spent in. */
+  chordNoteCount: number;
   lastChordMs: number;
   holdCount: number;
   /** Notes placed so far, used as the denominator of the SPACE budget. */
@@ -620,6 +641,7 @@ interface LaneState {
 
 interface LaneStats {
   chordCount: number;
+  chordNoteCount: number;
   holdCount: number;
   spaceCount: number;
   roleCounts: Record<CandidateRole, number>;
@@ -630,7 +652,8 @@ interface LaneStats {
 function assignLanes(
   candidates: Candidate[],
   analysis: AnalysisSummary,
-  settings: Required<Omit<GenerateOptions, 'songId' | 'title' | 'artist' | 'charter' | 'durationMs'>>,
+  settings: GeneratorSettings,
+  profile: LaneProfile,
   random: () => number,
   drop: DropCounters,
   warnings: string[],
@@ -638,11 +661,14 @@ function assignLanes(
   const notes: ChartNote[] = [];
   const context = gridContextOf(analysis);
   const state: LaneState = {
-    lastLane: CENTER,
+    // The walk starts in the middle of this layout: the centre key when there is one (SPACE), else
+    // the left of the middle pair, which is where a four-lane chart's accents live.
+    lastLane: profile.centerLane ?? Math.floor((profile.laneCount - 1) / 2),
     direction: 1,
-    usage: new Array<number>(LANE_COUNT).fill(0),
-    freeSince: new Array<number>(LANE_COUNT).fill(-Infinity),
+    usage: new Array<number>(profile.laneCount).fill(0),
+    freeSince: new Array<number>(profile.laneCount).fill(-Infinity),
     chordCount: 0,
+    chordNoteCount: 0,
     lastChordMs: -Infinity,
     holdCount: 0,
     noteCount: 0,
@@ -650,9 +676,19 @@ function assignLanes(
     lastSpaceMs: -Infinity,
     roleCounts: { ...EMPTY_ROLE_COUNTS },
   };
-  // Chords are counted in *notes*, not pairs: one chord adds two notes to the chart, so the budget
-  // has to be halved or the realised ratio comes out twice the configured one.
+  // Two chord budgets, because a chord has both a *count* and a *width*:
+  //
+  //  - `maxChords` bounds chord **events**. This is the phase 2.x rule verbatim
+  //    (`floor(N · ratio / 2)`, i.e. `ratio` of the chart when every chord is two notes), and it is
+  //    what keeps Hard byte-identical to the baseline.
+  //  - `maxChordNotes` bounds chord **notes**, so raising `maxChordSize` buys wider accents without
+  //    also buying more of them (a four-note chord spends two chord events' worth of notes).
+  //
+  // With the baseline's two-note chords the note budget is implied by the event budget
+  // (`2·(maxChords−1)+2 ≤ floor(N·ratio)`), so the event budget alone binds and the realised chord
+  // share is exactly `maxChordRatio`, as before.
   const maxChords = Math.max(1, Math.floor((candidates.length * settings.maxChordRatio) / 2));
+  const maxChordNotes = Math.max(2, Math.floor(candidates.length * settings.maxChordRatio));
   const maxHolds = Math.max(1, Math.floor(candidates.length * settings.maxHoldRatio));
 
   let gridOnlyNotes = 0;
@@ -662,7 +698,7 @@ function assignLanes(
 
   for (let index = 0; index < candidates.length; index += 1) {
     const candidate = candidates[index]!;
-    const lane = chooseLane(candidate, state, settings, context, random);
+    const lane = chooseLane(candidate, state, settings, context, profile, random);
     if (lane === null) {
       drop.droppedByLaneGap += 1;
       continue;
@@ -673,34 +709,41 @@ function assignLanes(
     state.roleCounts[candidate.role] = (state.roleCounts[candidate.role] ?? 0) + 1;
     if (candidate.gridOnly) gridOnlyNotes += 1;
     if (candidate.inWeakSection) lowConfidenceNotes += 1;
-    if (lane === CENTER) {
+    if (lane === profile.centerLane) {
       state.spaceCount += 1;
       state.lastSpaceMs = candidate.timeMs;
     }
-    let notesAtTime = 1;
 
-    // Chord: a genuine accent, room in the budget, and a clear two-hand shape.
+    // Chord: a genuine accent, room in the budget for at least a two-note chord, and a clear
+    // two-hand shape. The size comes from the difficulty (2 / 3 / 4 simultaneous notes) and is
+    // capped by whatever the budget still allows, so a chord never pushes the chart past its
+    // configured chord share.
+    const remaining = maxChordNotes - state.chordNoteCount;
     const chordEligible =
       candidate.fromOnset &&
       candidate.strength >= 0.6 &&
       candidate.barAccent &&
       state.chordCount < maxChords &&
+      remaining >= 2 &&
       candidate.timeMs - state.lastChordMs >= analysis.beatMs * 4 &&
       index + 1 < candidates.length;
     if (chordEligible) {
-      const partner = chooseChordPartner(lane, candidate, state, settings, random);
-      if (partner !== null) {
+      const size = Math.min(settings.maxChordSize, remaining, profile.laneCount);
+      const members = chooseChordMembers(lane, size, candidate, state, settings, profile, random);
+      for (const partner of members) {
         state.freeSince[partner] = candidate.timeMs;
         state.usage[partner] = (state.usage[partner] ?? 0) + 1;
         notes.push({ timeMs: round(candidate.timeMs), lane: partner, type: 'tap' });
-        // The partner is part of the same musical event, so it counts towards the same role (and
+        // Every member is part of the same musical event, so it counts towards the same role (and
         // towards `noteCount`, which keeps `roleCounts` summing to the chart's note count).
         state.noteCount += 1;
         state.roleCounts[candidate.role] = (state.roleCounts[candidate.role] ?? 0) + 1;
         noteRoles.push(candidate.role);
+      }
+      if (members.length > 0) {
         state.chordCount += 1;
+        state.chordNoteCount += members.length;
         state.lastChordMs = candidate.timeMs;
-        notesAtTime = 2;
       }
     }
 
@@ -716,19 +759,19 @@ function assignLanes(
     if (lane !== state.lastLane) state.direction = lane > state.lastLane ? 1 : -1;
     state.lastLane = lane;
     state.usage[lane] = (state.usage[lane] ?? 0) + 1;
-    void notesAtTime;
     noteRoles.push(candidate.role);
     notes.push(note);
   }
 
   // Roles travel with the notes into the coverage pass, so it can keep the mapping intact where
   // the chart allows it (see `ensureLaneCoverage`). `noteRoles[i]` is the role of `notes[i]`.
-  ensureLaneCoverage(notes, noteRoles, settings, state);
+  ensureLaneCoverage(notes, noteRoles, settings, state, profile);
   if (state.chordCount === 0) warnings.push('no accents were strong enough to place chords');
   return {
     notes: sortNotes(notes),
     stats: {
       chordCount: state.chordCount,
+      chordNoteCount: state.chordNoteCount,
       holdCount: state.holdCount,
       spaceCount: state.spaceCount,
       roleCounts: { ...state.roleCounts },
@@ -757,8 +800,9 @@ function assignLanes(
 function chooseLane(
   candidate: Candidate,
   state: LaneState,
-  settings: Required<Omit<GenerateOptions, 'songId' | 'title' | 'artist' | 'charter' | 'durationMs'>>,
+  settings: GeneratorSettings,
   context: GridContext,
+  profile: LaneProfile,
   random: () => number,
 ): number | null {
   const free = (lanes: readonly number[]): number[] =>
@@ -767,19 +811,24 @@ function chooseLane(
   // The role's own lanes come first; if the minimum gap blocks all of them, fall back to the
   // onset's register and only then to the whole keyboard. Without the ladder a busy passage would
   // simply drop notes (the phase-2 behaviour, counted as `droppedByLaneGap`).
-  let pool = free(ROLE_LANES[candidate.role]);
-  if (pool.length === 0 && candidate.band) pool = free(BAND_LANES[candidate.band]);
-  if (pool.length === 0) pool = free(ALL_LANES);
+  let pool = free(profile.roleLanes[candidate.role]);
+  if (pool.length === 0 && candidate.band) pool = free(profile.bandLanes[candidate.band]);
+  if (pool.length === 0) pool = free(profile.allLanes);
   if (pool.length === 0) return null;
 
-  // SPACE is rationed: it is the "main beat" key, so it is only offered to genuine accents, only
-  // while the budget lasts, and never twice inside one beat.
-  const spaceLanes = free([CENTER]);
-  const spaceOffered =
-    spaceLanes.length > 0 && spaceAllowed(candidate, state, settings, context) && pool.includes(CENTER);
-  if (pool.includes(CENTER) && !spaceOffered) {
-    const withoutSpace = pool.filter((lane) => lane !== CENTER);
-    pool = withoutSpace.length > 0 ? withoutSpace : free(ALL_LANES).filter((lane) => lane !== CENTER);
+  // SPACE (or, on a five-lane layout, its equivalent) is rationed: it is the "main beat" key, so it
+  // is only offered to genuine accents, only while the budget lasts, and never twice inside one
+  // beat. A layout without a centre key (four lanes) simply never offers it.
+  const centerLane = profile.centerLane;
+  const centerOffered =
+    centerLane !== null &&
+    pool.includes(centerLane) &&
+    candidate.timeMs - state.freeSince[centerLane]! >= settings.minLaneGapMs &&
+    spaceAllowed(candidate, state, settings, context, profile);
+  if (centerLane !== null && pool.includes(centerLane) && !centerOffered) {
+    const withoutCenter = pool.filter((lane) => lane !== centerLane);
+    pool =
+      withoutCenter.length > 0 ? withoutCenter : free(profile.allLanes).filter((lane) => lane !== centerLane);
   }
   if (pool.length === 0) return null;
 
@@ -788,18 +837,19 @@ function chooseLane(
 
   const direction = state.direction >= 0 ? 1 : -1;
   const target = state.lastLane + direction;
-  const preferred = ROLE_LANES[candidate.role];
+  const preferred = profile.roleLanes[candidate.role];
   let best = pool[0]!;
   let bestScore = -Infinity;
   for (const lane of pool) {
     const roleRank = preferred.indexOf(lane);
-    // The first two lanes of a role are its *meaning* (SPACE for an accent, A and L for percussion,
-    // S and K for support, D and J for melody); the rest of the ladder is only a fallback for when
-    // spacing blocks both, so it scores far lower. Without that gap the walk would happily drift a
-    // low percussion hit into the right hand, which is the failure this whole mapping replaces.
+    // The first two lanes of a role are its *meaning* (the centre key for an accent, A and L for
+    // percussion, S and K for support, D and J for melody); the rest of the ladder is only a
+    // fallback for when spacing blocks both, so it scores far lower. Without that gap the walk
+    // would happily drift a low percussion hit into the right hand, which is the failure this whole
+    // mapping replaces.
     const roleFit = roleRank === 0 ? 2 : roleRank === 1 ? 1.4 : 0.15;
     const score =
-      (lane === CENTER && spaceOffered ? 0.8 : 0) +
+      (centerLane !== null && lane === centerLane && centerOffered ? 0.8 : 0) +
       roleFit +
       -0.25 * Math.abs(lane - target) +
       -0.25 * (state.usage[lane] ?? 0) +
@@ -824,9 +874,13 @@ function chooseLane(
 function spaceAllowed(
   candidate: Candidate,
   state: LaneState,
-  settings: Required<Omit<GenerateOptions, 'songId' | 'title' | 'artist' | 'charter' | 'durationMs'>>,
+  settings: GeneratorSettings,
   context: GridContext,
+  profile: LaneProfile,
 ): boolean {
+  // A layout with no centre key has no "main beat" key to ration; the accent roles fall back to
+  // their next preference (S and K on four lanes), which the role ladder already handles.
+  if (profile.centerLane === null) return false;
   if (candidate.role !== 'downbeat' && candidate.role !== 'kick') return false;
   const budget = Math.max(4, Math.floor(settings.maxSpaceRatio * (state.noteCount + 1)));
   if (state.spaceCount >= budget) return false;
@@ -848,14 +902,15 @@ function ensureLaneCoverage(
   noteRoles: readonly CandidateRole[],
   settings: { minLaneGapMs: number },
   state: LaneState,
+  profile: LaneProfile,
 ): void {
   if (notes.length < 24) return;
   const usage = state.usage.slice();
-  for (let lane = 0; lane < LANE_COUNT; lane += 1) {
+  for (let lane = 0; lane < profile.laneCount; lane += 1) {
     if ((usage[lane] ?? 0) > 0) continue;
     // The coverage pass exists to spread the chart over the keyboard, not to promote notes into
-    // SPACE: that lane is rationed (see `spaceAllowed`), so it is filled by accents only.
-    if (lane === CENTER && state.spaceCount > 0) continue;
+    // the centre key: that lane is rationed (see `spaceAllowed`), so it is filled by accents only.
+    if (profile.centerLane !== null && lane === profile.centerLane && state.spaceCount > 0) continue;
     const eligible: Array<{ index: number; timeMs: number; from: number; consistent: boolean }> = [];
     for (let index = 0; index < notes.length; index += 1) {
       const note = notes[index]!;
@@ -870,7 +925,7 @@ function ensureLaneCoverage(
       // Prefer a note whose role ladder already contains this lane: a coverage move should keep the
       // chart's role mapping intact where it can, instead of relabelling an arbitrary note.
       const role = noteRoles[index];
-      const consistent = role !== undefined && ROLE_LANES[role].includes(lane);
+      const consistent = role !== undefined && profile.roleLanes[role].includes(lane);
       eligible.push({ index, timeMs: note.timeMs, from: note.lane, consistent });
     }
     if (eligible.length === 0) continue;
@@ -884,20 +939,58 @@ function ensureLaneCoverage(
   }
 }
 
-/** Second note of a chord: the other hand, one step away from the primary lane. */
-function chooseChordPartner(
-  lane: number,
+/**
+ * The remaining notes of a chord: up to `size - 1` lanes, always the other hand first.
+ *
+ * Alternating hands is what keeps a chord physically playable: a two-note accent is one finger of
+each hand, a three-note accent adds one back to the primary hand, and a four-note accent ends up
+ * two per hand. Inside the chosen hand the *mirrored* lane is preferred, so a chord looks like the
+ * accent it accompanies rather than a random cluster — and every member must clear the per-lane
+ * minimum gap, so a chord can never collide with a note already in flight in that lane.
+ *
+ * For `size === 2` this is exactly the phase-2 shape (mirrored lanes preferred, one draw from the
+ * seeded RNG), which is why a two-note-chord difficulty is byte-identical to before.
+ */
+function chooseChordMembers(
+  primaryLane: number,
+  size: number,
   candidate: Candidate,
   state: LaneState,
-  settings: Required<Omit<GenerateOptions, 'songId' | 'title' | 'artist' | 'charter' | 'durationMs'>>,
+  settings: GeneratorSettings,
+  profile: LaneProfile,
   random: () => number,
-): number | null {
-  const opposite = lane <= CENTER ? RIGHT_HAND : LEFT_HAND;
-  const free = opposite.filter((other) => candidate.timeMs - state.freeSince[other]! >= settings.minLaneGapMs);
-  if (free.length === 0) return null;
-  const mirrored = free.filter((other) => Math.abs(LANE_COUNT - 1 - lane - other) <= 1);
-  const pool = mirrored.length > 0 ? mirrored : free;
-  return pool[Math.floor(random() * pool.length)]!;
+): number[] {
+  const members: number[] = [];
+  const target = profile.laneCount - 1 - primaryLane;
+  const primaryHand = primaryLane < profile.laneCount / 2 ? profile.leftHand : profile.rightHand;
+  const otherHand = primaryHand === profile.leftHand ? profile.rightHand : profile.leftHand;
+  const available = (hand: readonly number[]): number[] =>
+    hand.filter(
+      (lane) =>
+        lane !== primaryLane &&
+        !members.includes(lane) &&
+        candidate.timeMs - state.freeSince[lane]! >= settings.minLaneGapMs,
+    );
+
+  let useOtherHand = true;
+  let misses = 0;
+  while (members.length < size - 1 && misses < 2) {
+    const pool = available(useOtherHand ? otherHand : primaryHand);
+    if (pool.length === 0) {
+      // This hand is blocked (the gap, or both its lanes already used): try the other one. Two
+      // consecutive misses mean both hands are exhausted for this instant, so the chord is simply
+      // smaller than the maximum.
+      useOtherHand = !useOtherHand;
+      misses += 1;
+      continue;
+    }
+    misses = 0;
+    const mirrored = pool.filter((lane) => Math.abs(target - lane) <= 1);
+    const choices = mirrored.length > 0 ? mirrored : pool;
+    members.push(choices[Math.floor(random() * choices.length)]!);
+    useOtherHand = !useOtherHand;
+  }
+  return members;
 }
 
 /** A hold when the music (and the note list) reliably implies a sustain. */
@@ -906,7 +999,7 @@ function holdFor(
   index: number,
   candidates: readonly Candidate[],
   analysis: AnalysisSummary,
-  settings: Required<Omit<GenerateOptions, 'songId' | 'title' | 'artist' | 'charter' | 'durationMs'>>,
+  settings: GeneratorSettings,
   maxHolds: number,
   state: LaneState,
   lane: number,
@@ -929,8 +1022,6 @@ function holdFor(
 }
 
 // ----------------------------------------------------------------------------------- helpers ---
-
-const ALL_LANES = Array.from({ length: LANE_COUNT }, (_, index) => index);
 
 function isQuiet(energy: EnergyProfile, timeMs: number): boolean {
   if (energy.lowEnergyRanges.length === 0) return false;
@@ -955,23 +1046,26 @@ function nearestCandidate(candidates: readonly Candidate[], timeMs: number, tole
 function buildBeatmap(
   notes: ChartNote[],
   analysis: AnalysisSummary,
-  settings: Required<Omit<GenerateOptions, 'songId' | 'title' | 'artist' | 'charter' | 'durationMs'>> & {
-    songId: string;
-    title: string;
-    artist?: string;
-    charter?: string;
-    durationMs?: number;
-  },
+  settings: GeneratorSettings &
+    Required<Pick<GenerateOptions, 'songId' | 'title'>> &
+    Pick<GenerateOptions, 'artist' | 'charter' | 'durationMs'>,
+  profile: LaneProfile,
 ): Beatmap {
   const chart: Beatmap = {
     schemaVersion: BEATMAP_SCHEMA_VERSION,
     songId: settings.songId,
     title: settings.title,
-    difficulty: 'normal',
+    difficulty: settings.difficulty,
+    // The lane count is part of the schema, not a UI hint: the validator, the engine's lane arrays
+    // and the renderer all read it, so a four-lane chart cannot be played on seven columns.
+    laneCount: profile.laneCount,
+    keyLabels: keyLabelsFor(profile.laneCount),
     bpm: round(analysis.bpm),
     offsetMs: 0,
     generator: { name: GENERATOR_NAME, version: GENERATOR_VERSION, seed: settings.seed },
     durationMs: settings.durationMs ?? analysis.durationMs,
+    noteDensity: round(notes.length / Math.max(1, (settings.durationMs ?? analysis.durationMs) / 1000)),
+    maxScore: maxTheoreticalScoreOf(notes, settings.difficultyWeight),
     notes,
   };
   if (settings.artist) chart.artist = settings.artist;
@@ -982,12 +1076,13 @@ function buildBeatmap(
 function summarize(
   chart: Beatmap,
   analysis: AnalysisSummary,
-  settings: Required<Omit<GenerateOptions, 'songId' | 'title' | 'artist' | 'charter' | 'durationMs'>>,
+  settings: GeneratorSettings,
   lanes: LaneStats,
   drop: DropCounters,
+  profile: LaneProfile,
 ): ChartStats {
   const notes = chart.notes;
-  const laneUsage = new Array<number>(LANE_COUNT).fill(0);
+  const laneUsage = new Array<number>(profile.laneCount).fill(0);
   for (const note of notes) laneUsage[note.lane] = (laneUsage[note.lane] ?? 0) + 1;
 
   const onsetTimes = analysis.onsets.map((onset) => onset.timeMs);
@@ -1004,6 +1099,16 @@ function summarize(
     peak = Math.max(peak, tail - head + 1);
   }
 
+  // Widest chord in the finished chart. Measured rather than assumed: it is the number a test
+  // checks against the difficulty's `maxChordSize`.
+  let maxSimultaneous = 0;
+  let simultaneous = 0;
+  for (let index = 0; index < times.length; index += 1) {
+    if (index > 0 && times[index]! === times[index - 1]!) simultaneous += 1;
+    else simultaneous = 1;
+    maxSimultaneous = Math.max(maxSimultaneous, simultaneous);
+  }
+
   const gaps: number[] = [];
   for (let index = 1; index < notes.length; index += 1) gaps.push(times[index]! - times[index - 1]!);
   const meanGap = gaps.length > 0 ? gaps.reduce((a, b) => a + b, 0) / gaps.length : 0;
@@ -1017,7 +1122,9 @@ function summarize(
     holdCount: notes.length - tapCount,
     chordCount: lanes.chordCount,
     holdRatio: notes.length > 0 ? (notes.length - tapCount) / notes.length : 0,
-    chordRatio: notes.length > 0 ? (lanes.chordCount * 2) / notes.length : 0,
+    // Chord share is measured in chord *notes*, so the number means the same thing whatever the
+    // chord size is: with four-note chords it would otherwise read as four times the budget.
+    chordRatio: notes.length > 0 ? lanes.chordNoteCount / notes.length : 0,
     notesPerSecond: durationMs > 0 ? (notes.length / durationMs) * 1000 : 0,
     peakNotesPerSecond: peak,
     chartDurationMs: round(durationMs),
@@ -1039,11 +1146,100 @@ function summarize(
     maxGapMs: round(gaps.length > 0 ? Math.max(...gaps) : 0),
     meanGapMs: round(meanGap),
     sectionsSkipped: analysis.energy.lowEnergyRanges.length,
-    spaceCount: laneUsage[CENTER] ?? 0,
-    spaceRatio: notes.length > 0 ? round((laneUsage[CENTER] ?? 0) / notes.length) : 0,
+    laneCount: profile.laneCount,
+    maxSimultaneous,
+    chordNoteCount: lanes.chordNoteCount,
+    spaceCount: profile.centerLane === null ? 0 : laneUsage[profile.centerLane] ?? 0,
+    spaceRatio:
+      notes.length > 0 && profile.centerLane !== null ? round((laneUsage[profile.centerLane] ?? 0) / notes.length) : 0,
     roleCounts: { ...lanes.roleCounts },
     gridOnlyNotes: lanes.gridOnlyNotes,
     lowConfidenceNotes: lanes.lowConfidenceNotes,
+  };
+}
+
+/**
+ * Stats derived from a chart's notes alone, with the analysis-dependent metrics zeroed.
+ *
+ * Used where a chart exists but no analysis does — the hand-authored demo chart, and a record whose
+ * stored stats are missing. Everything that *can* be measured from the note list is measured (counts,
+ * density, lane usage, chord and hold shares, the widest chord), so no consumer ever has to special
+ * case a chart without stats; what cannot be measured without onsets or a beat grid (the alignment
+ * ratios) is left at zero rather than guessed.
+ */
+export function basicStats(chart: Beatmap): ChartStats {
+  const notes = chart.notes;
+  const laneCount = lanesOf(chart);
+  const laneUsage = new Array<number>(laneCount).fill(0);
+  for (const note of notes) {
+    if (Number.isInteger(note.lane) && note.lane >= 0 && note.lane < laneCount) {
+      laneUsage[note.lane] = (laneUsage[note.lane] ?? 0) + 1;
+    }
+  }
+  const times = notes.map((note) => note.timeMs);
+  const durationMs = Math.max(1, chart.durationMs ?? times[times.length - 1] ?? 0);
+  let chordCount = 0;
+  let chordNoteCount = 0;
+  let maxSimultaneous = 0;
+  let simultaneous = 0;
+  for (let index = 0; index < times.length; index += 1) {
+    const same = index > 0 && times[index]! === times[index - 1]!;
+    simultaneous = same ? simultaneous + 1 : 1;
+    if (same) {
+      chordNoteCount += 1;
+      if (simultaneous === 2) chordCount += 1;
+    }
+    maxSimultaneous = Math.max(maxSimultaneous, simultaneous);
+  }
+  const tapCount = notes.filter((note) => note.type !== 'hold').length;
+  let peak = 0;
+  let head = 0;
+  for (let tail = 0; tail < times.length; tail += 1) {
+    while (times[tail]! - times[head]! >= 1000) head += 1;
+    peak = Math.max(peak, tail - head + 1);
+  }
+  const gaps: number[] = [];
+  for (let index = 1; index < times.length; index += 1) gaps.push(times[index]! - times[index - 1]!);
+  const lastEnd = notes.reduce(
+    (max, note) => Math.max(max, note.type === 'hold' ? note.timeMs + (note.durationMs ?? 0) : note.timeMs),
+    0,
+  );
+  return {
+    noteCount: notes.length,
+    tapCount,
+    holdCount: notes.length - tapCount,
+    chordCount,
+    chordNoteCount,
+    holdRatio: notes.length > 0 ? (notes.length - tapCount) / notes.length : 0,
+    chordRatio: notes.length > 0 ? chordNoteCount / notes.length : 0,
+    notesPerSecond: (notes.length / durationMs) * 1000,
+    peakNotesPerSecond: peak,
+    chartDurationMs: round(durationMs),
+    firstNoteMs: notes[0]?.timeMs ?? 0,
+    lastNoteEndMs: round(lastEnd),
+    laneUsage,
+    lanesUsed: laneUsage.filter((count) => count > 0).length,
+    laneCount,
+    maxSimultaneous,
+    onOnset: 0,
+    onBeat: 0,
+    onsetAlignRatio: 0,
+    beatAlignRatio: 0,
+    candidatesConsidered: notes.length,
+    droppedByDensity: 0,
+    droppedBySilence: 0,
+    droppedBySpacing: 0,
+    droppedByLaneGap: 0,
+    droppedByLaneExhausted: 0,
+    longGapCount: gaps.filter((gap) => gap > 2000).length,
+    maxGapMs: round(gaps.length > 0 ? Math.max(...gaps) : 0),
+    meanGapMs: round(gaps.length > 0 ? gaps.reduce((a, b) => a + b, 0) / gaps.length : 0),
+    sectionsSkipped: 0,
+    spaceCount: 0,
+    spaceRatio: 0,
+    roleCounts: { ...EMPTY_ROLE_COUNTS },
+    gridOnlyNotes: 0,
+    lowConfidenceNotes: 0,
   };
 }
 
@@ -1074,8 +1270,13 @@ function round(value: number): number {
   return Math.round(value * 1000) / 1000;
 }
 
-/** Exposed for tests: the lane sets the generator uses, so tests can assert coverage. */
-export const GENERATOR_LANES = { BAND_LANES, LEFT_HAND, RIGHT_HAND, CENTER } as const;
+/**
+ * Exposed for tests: the lane tables in use for a lane count (phase 3 moved them into
+ * `LaneProfile`, because the mapping depends on how many lanes there are).
+ */
+export function generatorLanes(laneCount = LANE_COUNT): LaneProfile {
+  return laneProfileFor(laneCount);
+}
 
 /** Re-exported for callers that build an `AnalysisSummary` from a full result. */
 export { intensityAtBeat };

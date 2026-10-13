@@ -18,11 +18,13 @@ import * as THREE from 'three';
 import type { RuntimeNote } from '../game/JudgmentEngine';
 import {
   JUDGMENT_COLORS,
-  LANE_COLORS,
   LANE_COUNT,
   PAST_VISIBLE_MS,
   PAST_VISIBLE_Z,
+  holdGeometry,
+  laneColorsFor,
   laneToX,
+  setActiveLanePalette,
   zForTimeToHit,
 } from './Layout';
 
@@ -47,7 +49,8 @@ export class NoteRenderer {
   private readonly geometry: THREE.BoxGeometry;
   private readonly capMaterial: THREE.MeshStandardMaterial;
   private readonly bodyMaterial: THREE.MeshStandardMaterial;
-  private readonly laneColors: THREE.Color[];
+  private laneColors: THREE.Color[];
+  private lanesValue = LANE_COUNT;
   private readonly missColor = new THREE.Color(JUDGMENT_COLORS.miss!);
   private readonly scratchMatrix = new THREE.Matrix4();
   private readonly scratchColor = new THREE.Color();
@@ -91,10 +94,35 @@ export class NoteRenderer {
       mesh.instanceColor?.setUsage(THREE.DynamicDrawUsage);
     }
 
-    this.laneColors = LANE_COLORS.map((hex) => new THREE.Color(hex));
+    this.laneColors = laneColorsFor(LANE_COUNT).map((hex) => new THREE.Color(hex));
 
     this.group.add(this.caps, this.bodies);
     parent.add(this.group);
+  }
+
+  get laneCount(): number {
+    return this.lanesValue;
+  }
+
+  /**
+   * Follow a chart's lane count. Only the colour table and the bounds check change: notes carry
+   * their own lane index and are positioned through `laneToX`, so nothing else has to be rebuilt.
+   */
+  setLaneCount(laneCount: number): void {
+    const lanes = Math.max(1, Math.min(LANE_COUNT, Math.round(laneCount) || LANE_COUNT));
+    if (lanes === this.lanesValue) return;
+    this.lanesValue = lanes;
+    this.laneColors = laneColorsFor(lanes).map((hex) => new THREE.Color(hex));
+    this.reset();
+  }
+
+  /**
+   * Switch the lane palette. The three colours live in `Layout` (one definition for notes, holds,
+   * receptors, lane strips and the key/touch indicators), so this only re-reads them.
+   */
+  setPalette(paletteId: string): void {
+    setActiveLanePalette(paletteId);
+    this.laneColors = laneColorsFor(this.lanesValue).map((hex) => new THREE.Color(hex));
   }
 
   /**
@@ -121,11 +149,15 @@ export class NoteRenderer {
       if (timeToHit > leadMs) break;
 
       const lane = note.lane;
-      if (lane < 0 || lane >= LANE_COUNT) continue;
-      // Defensive: a note whose time is long past can only be an unresolved leftover (for
-      // example the frame a seek jumps forward, before the engine resolves it). Drawing it
-      // would put a huge box on top of the camera, so it is skipped here.
-      if (timeToHit < -PAST_VISIBLE_MS && note.status !== 'missed') continue;
+      if (lane < 0 || lane >= this.lanesValue) continue;
+      // A hold whose *head* is past the line is still live while its tail is ahead — the player is
+      // holding it, and its trail has to keep drawing (its head is simply no longer shown; see the
+      // `holding` branch below). Everything else that is long past can only be an unresolved
+      // leftover (for example the frame a seek jumps forward, before the engine resolves it), and
+      // drawing it would put a huge box on top of the camera.
+      const liveHold =
+        note.type === 'hold' && note.status !== 'missed' && note.endTimeMs - songTimeMs > -PAST_VISIBLE_MS;
+      if (timeToHit < -PAST_VISIBLE_MS && note.status !== 'missed' && !liveHold) continue;
       const headZ = Math.min(PAST_VISIBLE_Z, zForTimeToHit(timeToHit, leadMs));
       const baseColor = this.laneColors[lane]!;
 
@@ -147,10 +179,18 @@ export class NoteRenderer {
         }
 
         case 'holding': {
-          const tailTime = note.endTimeMs - songTimeMs;
-          const tailZ = Math.min(0, zForTimeToHit(tailTime, leadMs));
-          const length = Math.max(0.3, Math.abs(tailZ));
-          bodyCount = this.writeBody(bodyCount, lane, tailZ / 2, length, baseColor, BRIGHT_MIX);
+          // The head has been consumed, so the remaining body runs from the hit line to the tail —
+          // the same geometry function the falling state uses, anchored at the line instead of at
+          // the head, which is what stops the body jumping when the head is hit.
+          const geometry = holdGeometry({
+            timeMs: note.timeMs,
+            endTimeMs: note.endTimeMs,
+            songTimeMs,
+            leadMs,
+            anchoredToLine: true,
+          });
+          const length = Math.max(0.3, geometry.bodyLength);
+          bodyCount = this.writeBody(bodyCount, lane, geometry.bodyCenterZ, length, baseColor, BRIGHT_MIX);
           continue;
         }
 
@@ -158,18 +198,35 @@ export class NoteRenderer {
         default: {
           const bright = Math.abs(timeToHit) <= BRIGHT_WINDOW_MS;
           if (note.type === 'hold' && note.durationMs > 0) {
-            const tailZ = zForTimeToHit(timeToHit + note.durationMs, leadMs);
-            const length = Math.max(0.3, Math.abs(tailZ - headZ));
+            // Head cap at the head's own z, tail cap at the tail's, body exactly between them: all
+            // three from `holdGeometry`, so the trail can never detach from the head, and a hold
+            // longer than the visible road is clipped at the spawn plane instead of stretching
+            // (see `Layout.holdGeometry`).
+            const geometry = holdGeometry({
+              timeMs: note.timeMs,
+              endTimeMs: note.endTimeMs,
+              songTimeMs,
+              leadMs,
+              anchoredToLine: false,
+            });
+            const length = Math.max(0.3, geometry.bodyLength);
             bodyCount = this.writeBody(
               bodyCount,
               lane,
-              (headZ + tailZ) / 2,
+              geometry.bodyCenterZ,
               length,
               baseColor,
               bright ? BRIGHT_MIX : 0.08,
             );
-            capCount = this.writeCap(capCount, lane, headZ, baseColor, 1, HOLD_CAP_SCALE);
-            capCount = this.writeCap(capCount, lane, tailZ, baseColor, TAIL_CAP_SCALE_FACTOR, HOLD_CAP_SCALE);
+            capCount = this.writeCap(capCount, lane, geometry.headZ, baseColor, 1, HOLD_CAP_SCALE);
+            capCount = this.writeCap(
+              capCount,
+              lane,
+              geometry.tailZ,
+              baseColor,
+              TAIL_CAP_SCALE_FACTOR,
+              HOLD_CAP_SCALE,
+            );
           } else {
             capCount = this.writeCap(capCount, lane, headZ, baseColor, 1, CAP_SCALE, bright ? BRIGHT_MIX : 0);
           }
@@ -268,7 +325,7 @@ export class NoteRenderer {
     color: THREE.Color,
     brightMix: number,
   ): number {
-    this.scratchPosition.set(laneToX(lane), y, Math.min(PAST_VISIBLE_Z, z));
+    this.scratchPosition.set(laneToX(lane, this.lanesValue), y, Math.min(PAST_VISIBLE_Z, z));
     this.scratchScale.set(
       scale.x * scaleFactor,
       scale.y * scaleFactor,

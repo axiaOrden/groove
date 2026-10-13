@@ -25,10 +25,25 @@
  */
 
 import type { TimingWindows } from '../chart/ChartTypes';
+import { ALL_LANE_KEY_CODES, DIFFICULTY_PROFILES, keyCodeToLane, type KeyBinding } from '../chart/Difficulty';
+// The lane palettes are renderer geometry (they are per *lane*, and live beside `laneColorsFor`), so
+// the default id is read from there instead of being spelled out again here.
+import { DEFAULT_LANE_PALETTE_ID, isLanePaletteId } from '../renderer/Layout';
 
-export type JudgmentType = 'perfect' | 'good' | 'bad' | 'miss';
+// Scoring lives in `chart/ScoreModel` because the chart layer has to be able to state a chart's
+// theoretical maximum before a note is ever played. Re-exported here so every existing import of
+// `JudgmentType` / `ScoreRules` / `DEFAULT_SCORE_RULES` from the game layer keeps working.
+import {
+  DEFAULT_SCORE_RULES,
+  JUDGMENT_TYPES,
+  gradeForAccuracy,
+  type Grade,
+  type JudgmentType,
+  type ScoreRules,
+} from '../chart/ScoreModel';
 
-export const JUDGMENT_TYPES: readonly JudgmentType[] = ['perfect', 'good', 'bad', 'miss'];
+export type { Grade, JudgmentType, ScoreRules };
+export { DEFAULT_SCORE_RULES, JUDGMENT_TYPES, gradeForAccuracy };
 
 /** PERFECT and GOOD build combo; BAD and MISS break it. Boundaries are inclusive upper bounds. */
 export const DEFAULT_TIMING_WINDOWS: TimingWindows = {
@@ -44,65 +59,32 @@ export function isComboIncreasing(judgment: JudgmentType): boolean {
   return judgment === 'perfect' || judgment === 'good';
 }
 
-export interface LaneKey {
-  lane: number;
-  /** Label shown in the HUD. */
-  label: string;
-  /** `KeyboardEvent.code`, i.e. the physical key, so the layout does not matter. */
-  code: string;
-}
+/** A lane's key: the same shape as `chart/Difficulty`'s `KeyBinding`, kept as an alias here because
+ * the game layer talks about "lane keys" rather than about difficulties. */
+export type LaneKey = KeyBinding;
 
-export const LANE_KEYS: readonly LaneKey[] = [
-  { lane: 0, label: 'A', code: 'KeyA' },
-  { lane: 1, label: 'S', code: 'KeyS' },
-  { lane: 2, label: 'D', code: 'KeyD' },
-  { lane: 3, label: 'SPACE', code: 'Space' },
-  { lane: 4, label: 'J', code: 'KeyJ' },
-  { lane: 5, label: 'K', code: 'KeyK' },
-  { lane: 6, label: 'L', code: 'KeyL' },
-];
+/**
+ * The seven-key map (Hard), kept as the default so existing callers and tests do not have to name a
+ * difficulty. Phase 3 makes the *active* map per-difficulty: `InputManager.setKeyLayout` installs
+ * the four-, five- or seven-key map when a chart loads.
+ */
+export const LANE_KEYS: readonly LaneKey[] = DIFFICULTY_PROFILES.hard.keys;
 
 export const KEY_CODE_TO_LANE: Readonly<Record<string, number>> = Object.freeze(
-  LANE_KEYS.reduce<Record<string, number>>((map, entry) => {
-    map[entry.code] = entry.lane;
-    return map;
-  }, {}),
+  keyCodeToLane(LANE_KEYS),
 );
 
-export interface ScoreRules {
-  /** Points for a tap before the combo multiplier. */
-  basePoints: Record<JudgmentType, number>;
-  /** Multiplier grows by this per combo step: 1 + step * min(combo, cap). */
-  comboMultiplierStep: number;
-  /** Combo value at which the multiplier stops growing. */
-  comboMultiplierCap: number;
-  /** A tap is worth this many units; a hold head + tail is worth `holdWeight` units in total. */
-  tapWeight: number;
-  holdWeight: number;
-  /** Releasing within this many ms of the tail still counts as completing the hold. */
-  holdReleaseGraceMs: number;
+/** Build the key-code map for a layout. Used by the input manager on difficulty change. */
+export function keyMapFor(keys: readonly LaneKey[]): Record<string, number> {
+  return keyCodeToLane(keys);
 }
 
-export const DEFAULT_SCORE_RULES: ScoreRules = {
-  basePoints: { perfect: 300, good: 200, bad: 100, miss: 0 },
-  comboMultiplierStep: 0.01,
-  comboMultiplierCap: 100,
-  tapWeight: 1,
-  holdWeight: 2,
-  holdReleaseGraceMs: 100,
-};
-
-export type Grade = 'S' | 'A' | 'B' | 'C' | 'D' | 'F';
-
-/** Accuracy-derived grade. Accuracy is judgment-weighted and combo independent. */
-export function gradeForAccuracy(accuracy: number): Grade {
-  if (accuracy >= 0.95) return 'S';
-  if (accuracy >= 0.9) return 'A';
-  if (accuracy >= 0.8) return 'B';
-  if (accuracy >= 0.7) return 'C';
-  if (accuracy >= 0.6) return 'D';
-  return 'F';
-}
+/**
+ * Every key that belongs to *any* difficulty (A S D SPACE J K L). The input manager suppresses the
+ * browser's default action for all of them whatever the active lane count is, so SPACE cannot
+ * scroll the page on a four-lane chart where it is not a lane.
+ */
+export { ALL_LANE_KEY_CODES };
 
 export interface GameSettings {
   /** See the offset conventions above. */
@@ -111,13 +93,21 @@ export interface GameSettings {
   noteSpeed: number;
   /** 0..1 master volume for the demo track and feedback ticks. */
   volume: number;
+  /** Id of the lane palette (`LANE_PALETTES` in `renderer/Layout`). Purely visual. */
+  lanePalette: string;
 }
 
 export const DEFAULT_SETTINGS: GameSettings = {
   globalOffsetMs: 0,
   noteSpeed: 1,
   volume: 0.7,
+  lanePalette: DEFAULT_LANE_PALETTE_ID,
 };
+
+/** Clamp a palette id: an unknown or hand-edited value falls back to the default theme. */
+export function clampLanePalette(value: unknown): string {
+  return isLanePaletteId(value) ? value : DEFAULT_LANE_PALETTE_ID;
+}
 
 export const OFFSET_LIMITS = { min: -200, max: 200, step: 5 } as const;
 export const NOTE_SPEED_LIMITS = { min: 0.5, max: 2.5, step: 0.1 } as const;

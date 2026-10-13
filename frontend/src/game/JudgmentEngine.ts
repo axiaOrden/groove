@@ -44,6 +44,11 @@ export interface RuntimeNote {
   headJudgment: JudgmentType | null;
   /** Timing error of the head judgment in ms (signed: negative = early). */
   headErrorMs: number | null;
+  /**
+   * Combo value the head was awarded at. A hold's tail is scored at this multiplier, so a hold is
+   * worth the same however late inside its release window the player lets go (see `ScoreModel`).
+   */
+  headCombo: number | null;
   /** True when the head was hit AND the hold was released before its tail. */
   releasedEarly: boolean;
 }
@@ -108,6 +113,7 @@ export function createRuntimeNotes(
       status: 'pending',
       headJudgment: null,
       headErrorMs: null,
+      headCombo: null,
       releasedEarly: false,
     };
   });

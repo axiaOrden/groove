@@ -17,17 +17,31 @@ import { renderDemoTrack } from '../audio/DemoSynth';
 import { AnalysisClient } from '../analysis/AnalysisClient';
 import { prepareBeatmap } from '../chart/ChartValidator';
 import type { Beatmap } from '../chart/ChartTypes';
+import { lanesOf } from '../chart/ChartTypes';
 import { buildDemoChart } from '../chart/demoChart';
+import {
+  availableDifficulties,
+  chartSetFromCharts,
+  defaultDifficultyOf,
+  generateChartSet,
+  primaryChart,
+  type ChartSet,
+} from '../chart/DifficultySet';
+import { basicStats } from '../chart/ChartGenerator';
+import { difficultyProfile, keyLabelsFor, type ChartDifficulty } from '../chart/Difficulty';
+import { maxTheoreticalScoreOf } from '../chart/ScoreModel';
 import { DEMO_BEAT_MS, DEMO_BPM, SECTIONS } from '../content/demoSong';
 import type { GameEvent } from '../game/GameEngine';
 import { GameEngine } from '../game/GameEngine';
-import { InputManager } from '../game/InputManager';
+import { InputManager, keyLayoutFor } from '../game/InputManager';
 import type { GameSettings } from '../game/GameConfig';
+import type { PlayResults } from '../game/ScoreManager';
+import type { ScoreEntry } from '../storage/ScoreStore';
 import type { Framing } from '../renderer/CameraFraming';
 import { computeFraming } from '../renderer/CameraFraming';
 import { EffectRenderer, type EffectKind } from '../renderer/EffectRenderer';
 import { LaneRenderer } from '../renderer/LaneRenderer';
-import { LANE_COUNT, leadMsForSpeed } from '../renderer/Layout';
+import { LANE_COUNT, leadMsForSpeed, setActiveLanePalette } from '../renderer/Layout';
 import { NoteRenderer } from '../renderer/NoteRenderer';
 import { SceneManager } from '../renderer/SceneManager';
 import { openSongLibrary, type SongStore } from '../storage/SongLibrary';
@@ -50,7 +64,7 @@ import { OrientationGate } from './OrientationGate';
 import { Overlay } from './Overlay';
 import { ResultsScreen } from './ResultsScreen';
 import { TouchSurface } from './TouchSurface';
-import { el, setText } from './dom';
+import { el, setHidden, setText } from './dom';
 
 export type AppState = 'loading' | 'ready' | 'playing' | 'paused' | 'results' | 'error';
 
@@ -82,7 +96,7 @@ export class GameApp {
   private readonly input: InputManager;
   private readonly touchSurface: TouchSurface;
   private readonly orientationGate: OrientationGate;
-  private readonly pressedState = new Array<boolean>(LANE_COUNT).fill(false);
+  private pressedState = new Array<boolean>(LANE_COUNT).fill(false);
 
   /**
    * The chart and engine are swappable in phase 2: importing a song replaces both, and the demo
@@ -91,10 +105,23 @@ export class GameApp {
    */
   private chartValue: Beatmap;
   private engineValue: GameEngine;
+  /**
+   * Every difficulty of the current song, so switching costs no re-analysis and no reload. The demo
+   * chart and a pre-phase-3 saved song have a single entry (Hard), which is why this is partial.
+   */
+  private chartSetValue: ChartSet;
+  private difficultyValue: ChartDifficulty = 'hard';
+  /** Best stored run for (song, difficulty), refreshed when a run finishes. */
+  private bestScore: ScoreEntry | null = null;
   private readonly demoChart: Beatmap;
   private demoBuffer: AudioBuffer | null = null;
   /** Beat length of the *current* chart, used for the count-in and the HUD. */
   private beatMs = DEMO_BEAT_MS;
+  /**
+   * Theoretical maximum for the loaded chart, computed once per load. The HUD reads it every frame,
+   * so it must not be derived from a fresh engine result each time.
+   */
+  private maxScoreValue = 0;
   private songSubtitle = '';
   private songSource: 'demo' | 'import' | 'library' = 'demo';
   private readonly analysisClient = new AnalysisClient();
@@ -122,6 +149,32 @@ export class GameApp {
   constructor(private readonly canvas: HTMLCanvasElement) {
     this.demoChart = prepareBeatmap(buildDemoChart());
     this.chartValue = this.demoChart;
+    // The demo chart is loaded here directly (the ready panel's "start" path does not go through
+    // `loadSong`), so its maximum has to be resolved here too: the HUD shows the score as a share of
+    // it, and a stale 0 would read as "0 · 0.00 %" for the whole run.
+    this.maxScoreValue = this.maxScoreFor(this.demoChart, this.difficultyValue);
+    // The hand-authored demo is a single seven-key chart: no analysis exists for it, so there is
+    // nothing to generate the other two difficulties *from*. It is presented as Hard, which is what
+    // its seven lanes are.
+    this.chartSetValue = chartSetFromCharts({
+      songId: this.demoChart.songId,
+      title: this.demoChart.title,
+      ...(this.demoChart.artist ? { artist: this.demoChart.artist } : {}),
+      durationMs: this.demoChart.durationMs ?? 0,
+      bpm: this.demoChart.bpm,
+      generator: { ...this.demoChart.generator },
+      charts: [
+        {
+          difficulty: 'hard',
+          profile: difficultyProfile('hard'),
+          chart: this.demoChart,
+          stats: basicStats(this.demoChart),
+          validation: { ok: true, errors: [], warnings: [] },
+          warnings: [],
+        },
+      ],
+    });
+    this.difficultyValue = 'hard';
     this.settingsCache = this.settings.get();
     this.deviceProfile = readDeviceProfile(window, el('stage'), window.location?.search ?? '');
     // Publish the layout mode so the stylesheet can compact the HUD; set before the first
@@ -172,6 +225,16 @@ export class GameApp {
 
     this.audio.setInterruptionHandler(() => this.pause(true));
 
+    // Difficulty switching from the pause menu: the chart set is already in memory, so this is a
+    // chart swap plus a restart, never a re-analysis.
+    el('pause-difficulty-options').addEventListener('click', (event) => {
+      const button = (event.target as HTMLElement | null)?.closest('button[data-difficulty]') as HTMLButtonElement | null;
+      const difficulty = button?.dataset.difficulty;
+      if (difficulty === 'easy' || difficulty === 'normal' || difficulty === 'hard') {
+        void this.setDifficulty(difficulty);
+      }
+    });
+
     this.input = new InputManager(
       {
         nowMs: () => this.audio.getSongTimeMs(),
@@ -203,6 +266,9 @@ export class GameApp {
     this.songSubtitle = this.describeDemoChart();
     this.updateSongInfo();
     this.hud.show(false);
+    // The player's saved palette is applied before the first frame, so the highway never flashes
+    // the default theme after a reload.
+    this.applyLanePalette(this.settingsCache.lanePalette);
   }
 
   // -------------------------------------------------------------- accessors --
@@ -323,7 +389,8 @@ export class GameApp {
   async startDemo(): Promise<void> {
     if (this.songSource !== 'demo' || !this.demoBuffer) {
       this.loadSong({
-        chart: this.demoChart,
+        set: this.chartSetValue,
+        difficulty: 'hard',
         buffer: this.demoBuffer ?? (await this.renderDemoIfNeeded()),
         record: null,
         fromLibrary: false,
@@ -369,7 +436,11 @@ export class GameApp {
    * timing layers are untouched — they only ever see "the current chart".
    */
   loadSong(song: PlayableSong): void {
-    this.chartValue = prepareBeatmap(song.chart);
+    this.chartSetValue = song.set;
+    this.difficultyValue = song.difficulty;
+    const chart = song.set.charts[song.difficulty]?.chart ?? primaryChart(song.set)?.chart;
+    if (!chart) throw new Error('the song has no chart for that difficulty');
+    this.chartValue = prepareBeatmap(chart);
     this.engineValue = new GameEngine({
       chart: this.chartValue,
       clock: this.audio,
@@ -379,16 +450,136 @@ export class GameApp {
     this.audio.setVolume(this.settingsCache.volume);
     this.durationMs = song.buffer.duration * 1000;
     this.beatMs = 60000 / this.chartValue.bpm;
+    this.maxScoreValue = this.maxScoreFor(this.chartValue, this.difficultyValue);
     this.songSource = song.source ?? (song.fromLibrary ? 'library' : 'import');
     this.songSubtitle = this.describeChart(this.chartValue, this.songSource, song.record !== null);
     this.updateSongInfo();
     if (song.diagnostics) this.diagnosticsPanel.show(song.diagnostics);
     else this.diagnosticsPanel.clear();
+    // Lane count, key map, HUD strip and touch columns all follow the chart that is now loaded. This
+    // is the single place that decides "how many lanes are we rendering", so nothing can disagree.
+    this.applyLaneLayout(this.chartValue);
+    this.refreshBestScore();
+    this.renderPauseDifficulty();
     this.hud.reset();
     this.noteRenderer.reset();
     this.effectRenderer.clear();
     this.laneRenderer.reset();
     this.stateValue = 'ready';
+  }
+
+  /**
+   * Point every view and the input layer at a chart's lane count.
+   *
+   * Cheap and idempotent, so it runs on every load: the renderers rebuild nothing when the count is
+   * unchanged, and the camera is re-solved (which the touch columns are derived from) so four lanes
+   * get four wide columns instead of four narrow ones in a seven-lane road.
+   */
+  private applyLaneLayout(chart: Beatmap): void {
+    const laneCount = lanesOf(chart);
+    const labels = chart.keyLabels ?? keyLabelsFor(laneCount);
+    this.laneRenderer.setLaneCount(laneCount);
+    this.noteRenderer.setLaneCount(laneCount);
+    this.effectRenderer.setLaneCount(laneCount);
+    this.hud.setLaneCount(laneCount);
+    this.touchSurface.setLaneCount(laneCount, labels);
+    this.input.setKeyLayout({ laneCount, keys: difficultyProfile(this.difficultyValue).keys });
+    this.pressedState = new Array<boolean>(laneCount).fill(false);
+    this.resize();
+  }
+
+  /**
+   * The maximum score for a chart: the number the chart itself carries when it was generated, or the
+   * same formula applied to its notes at the difficulty's weight (`chart/ScoreModel.ts`). A flawless
+   * run reaches it, so the HUD's score/max percentage can read 100.00 %.
+   */
+  private maxScoreFor(chart: Beatmap, difficulty: ChartDifficulty): number {
+    return chart.maxScore ?? maxTheoreticalScoreOf(chart.notes, difficultyProfile(difficulty).scoreWeight);
+  }
+
+  /**
+   * Switch difficulty without re-analysing or re-decoding anything: the chart is already in
+   * `chartSetValue`, so this swaps the chart and restarts the run.
+   */
+  async setDifficulty(difficulty: ChartDifficulty): Promise<void> {
+    if (difficulty === this.difficultyValue) return;
+    if (!this.chartSetValue.charts[difficulty]) return;
+    const buffer = this.audio.currentBuffer;
+    if (!buffer) return;
+    const wasPlaying = this.stateValue === 'playing' || this.stateValue === 'paused';
+    this.audio.pause();
+    this.input.setEnabled(false);
+    this.touchSurface.setInteractive(false);
+    this.loadSong({
+      set: this.chartSetValue,
+      difficulty,
+      buffer,
+      record: null,
+      fromLibrary: this.songSource === 'library',
+      diagnostics: null,
+      source: this.songSource,
+    });
+    this.overlay.showPanel('ready');
+    if (wasPlaying) await this.start();
+  }
+
+  /** Difficulties available for the current song, for the UI. */
+  get availableDifficulties(): ChartDifficulty[] {
+    return availableDifficulties(this.chartSetValue);
+  }
+
+  get difficulty(): ChartDifficulty {
+    return this.difficultyValue;
+  }
+
+  get bestScoreValue(): ScoreEntry | null {
+    return this.bestScore;
+  }
+
+  /** Load the stored best for the current song + difficulty (never throws: scores are optional). */
+  private refreshBestScore(): void {
+    const scores = this.library?.scores;
+    if (!scores) {
+      this.bestScore = null;
+      return;
+    }
+    void scores
+      .best(this.chartValue.songId, this.difficultyValue)
+      .then((entry) => {
+        this.bestScore = entry;
+      })
+      .catch(() => {
+        this.bestScore = null;
+      });
+  }
+
+  /**
+   * Persist a finished run. Only songs with an id get a score (the demo chart included: it has one,
+   * and "best on the demo" is a real thing to want), and only the best run per difficulty is kept.
+   */
+  private async recordScore(results: PlayResults): Promise<void> {
+    const scores = this.library?.scores;
+    if (!scores) return;
+    try {
+      const submitted = await scores.submit({
+        songId: this.chartValue.songId,
+        title: this.chartValue.title,
+        difficulty: this.difficultyValue,
+        difficultyWeight: results.difficultyWeight,
+        generatorVersion: this.chartValue.generator.version,
+        score: results.score,
+        maxScore: results.maxScore,
+        accuracy: results.accuracy,
+        grade: results.grade,
+        maxCombo: results.maxCombo,
+        totalNotes: results.totalNotes,
+      });
+      const previous = this.bestScore;
+      this.bestScore = submitted.entry;
+      this.resultsScreen.showBest(submitted.entry, submitted.isBest && previous !== null && previous.score < submitted.entry.score);
+    } catch {
+      // A score that cannot be stored must not spoil the results screen.
+    }
   }
 
   /** Called by the import panel when the player presses "Play this chart". */
@@ -404,9 +595,28 @@ export class GameApp {
     await this.start();
   }
 
+  /** Fill the pause panel's difficulty switcher (hidden when the song has only one chart). */
+  private renderPauseDifficulty(): void {
+    const available = availableDifficulties(this.chartSetValue);
+    setHidden(el('pause-difficulty'), available.length < 2);
+    const container = el('pause-difficulty-options');
+    container.replaceChildren();
+    for (const difficulty of available) {
+      const profile = difficultyProfile(difficulty);
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'btn btn-sm btn-small';
+      button.dataset.difficulty = difficulty;
+      button.dataset.active = difficulty === this.difficultyValue ? 'true' : 'false';
+      button.textContent = `${profile.short} · ×${profile.scoreWeight.toFixed(1)}`;
+      container.appendChild(button);
+    }
+  }
+
   pause(auto: boolean): void {
     if (this.stateValue !== 'playing') return;
     this.audio.pause();
+    this.renderPauseDifficulty();
     this.handleEvents(this.engine.pause());
     this.stateValue = 'paused';
     this.pausedByFocus = auto;
@@ -557,6 +767,9 @@ export class GameApp {
     this.touchSurface.clearLanes();
     this.resultsScreen.render(event.results);
     this.overlay.showPanel('results');
+    // Persisting is asynchronous and must never delay the results screen; the best score row fills
+    // in when the store answers (see `recordScore`).
+    void this.recordScore(event.results);
   }
 
   private handleEvents(events: readonly GameEvent[]): void {
@@ -625,6 +838,9 @@ export class GameApp {
         countInRemainingMs: this.playStartSongMs - songTimeMs,
         beatMs: this.beatMs,
         countInMs: this.countInMs,
+        difficulty: this.difficultyValue,
+        laneCount: this.chartValue.laneCount ?? LANE_COUNT,
+        maxScore: this.maxScoreValue,
       });
     }
 
@@ -665,6 +881,9 @@ export class GameApp {
       viewportHeight: height,
       insets: this.deviceProfile.safeInsets,
       touchLayout: this.deviceProfile.touchLayout,
+      // The lane count of the chart being played decides how wide the road is drawn and how the
+      // mobile camera spreads the columns (the touch layer follows the same projection).
+      laneCount: this.chartValue.laneCount ?? LANE_COUNT,
     });
     this.scene.applyFraming(this.framing);
     document.documentElement.dataset.framing = this.framing.mode;
@@ -687,9 +906,27 @@ export class GameApp {
   }
 
   private applySettings(settings: GameSettings): void {
+    const paletteChanged = settings.lanePalette !== this.settingsCache.lanePalette;
     this.settingsCache = settings;
     this.engine.setGlobalOffsetMs(settings.globalOffsetMs);
     this.audio.setVolume(settings.volume);
+    if (paletteChanged) this.applyLanePalette(settings.lanePalette);
+  }
+
+  /**
+   * Point every view at a lane palette.
+   *
+   * Every lane colour in the game comes from one definition (`LANE_PALETTES` in
+   * `renderer/Layout`), so "switch theme" is a handful of rebuilds: the highway strips and
+   * receptors, the note/hold instance colours, the HUD key strip and the touch pads. Called once at
+   * boot and whenever the settings change, never mid-song by itself.
+   */
+  private applyLanePalette(paletteId: string): void {
+    setActiveLanePalette(paletteId);
+    this.laneRenderer.setPalette(paletteId);
+    this.noteRenderer.setPalette(paletteId);
+    this.hud.setPalette(paletteId);
+    this.touchSurface.setPalette(paletteId);
   }
 
   private updateSongInfo(): void {
@@ -700,7 +937,7 @@ export class GameApp {
   private describeDemoChart(): string {
     const bars = SECTIONS.verse.chart.length;
     return (
-      `${this.demoChart.difficulty} · ${DEMO_BPM} BPM · ${this.demoChart.notes.length} notes · ` +
+      `hard · 7 keys · ${DEMO_BPM} BPM · ${this.demoChart.notes.length} notes · ` +
       `hand-authored demo chart (${bars}-bar loops)`
     );
   }
@@ -708,7 +945,11 @@ export class GameApp {
   private describeChart(chart: Beatmap, source: 'demo' | 'import' | 'library', saved: boolean): string {
     if (source === 'demo') return this.describeDemoChart();
     const origin = source === 'library' ? 'saved chart' : saved ? 'generated from your MP3, saved' : 'generated from your MP3';
-    return `${chart.difficulty} · ${chart.bpm.toFixed(2)} BPM · ${chart.notes.length} notes · ${origin}`;
+    const lanes = lanesOf(chart);
+    return (
+      `${chart.difficulty} · ${lanes} keys · ×${difficultyProfile(this.difficultyValue).scoreWeight.toFixed(1)} · ` +
+      `${chart.bpm.toFixed(2)} BPM · ${chart.notes.length} notes · ${origin}`
+    );
   }
 
   private fail(error: unknown): void {
@@ -736,7 +977,35 @@ export class GameApp {
         beatMs: this.beatMs,
         notes: this.chartValue.notes.length,
         difficulty: this.chartValue.difficulty,
+        laneCount: lanesOf(this.chartValue),
+        keyLabels: this.chartValue.keyLabels ?? keyLabelsFor(lanesOf(this.chartValue)),
+        maxScore: this.chartValue.maxScore ?? null,
         generator: this.chartValue.generator,
+      },
+      /** Difficulty switching: what the current song has, and which one is loaded. */
+      difficulties: {
+        current: this.difficultyValue,
+        available: availableDifficulties(this.chartSetValue),
+        visible: availableDifficulties(this.chartSetValue),
+        charts: Object.fromEntries(
+          availableDifficulties(this.chartSetValue).map((difficulty) => {
+            const entry = this.chartSetValue.charts[difficulty]!;
+            return [
+              difficulty,
+              {
+                lanes: lanesOf(entry.chart),
+                notes: entry.chart.notes.length,
+                notesPerSecond: entry.stats.notesPerSecond,
+                maxScore: entry.chart.maxScore ?? null,
+                scoreWeight: entry.profile.scoreWeight,
+                valid: entry.validation.ok,
+              },
+            ];
+          }),
+        ),
+        best: this.bestScore
+          ? { score: this.bestScore.score, accuracy: this.bestScore.accuracy, grade: this.bestScore.grade }
+          : null,
       },
       library: {
         available: this.library !== null,

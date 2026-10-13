@@ -59,8 +59,22 @@
  * which is also why touch needs no special latency handling: there is no per-frame input poll.
  */
 
-import { KEY_CODE_TO_LANE, LANE_KEYS } from './GameConfig';
+import { ALL_LANE_KEY_CODES, KEY_CODE_TO_LANE, LANE_KEYS, keyMapFor, type LaneKey } from './GameConfig';
+import { laneProfileFor } from '../chart/LaneProfile';
+import { keyLabelsFor, difficultyProfile, type ChartDifficulty } from '../chart/Difficulty';
 import { LanePressTracker } from './LanePressTracker';
+
+/** A lane count plus the keys bound to it — the input half of a difficulty. */
+export interface KeyLayout {
+  laneCount: number;
+  keys: readonly LaneKey[];
+}
+
+/** The layout for a difficulty (Easy 4 / Normal 5 / Hard 7). */
+export function keyLayoutFor(difficulty: ChartDifficulty): KeyLayout {
+  const profile = difficultyProfile(difficulty);
+  return { laneCount: profile.laneCount, keys: profile.keys };
+}
 
 export interface InputCallbacks {
   /** Authoritative song time in ms (usually the audio clock). */
@@ -90,7 +104,10 @@ function isPointerSurface(value: HTMLElement | PointerSurface): value is Pointer
 }
 
 export class InputManager {
-  private readonly tracker = new LanePressTracker(LANE_KEYS.length);
+  /** Swapped by `setKeyLayout` when a chart of another difficulty loads. */
+  private tracker = new LanePressTracker(LANE_KEYS.length);
+  private keyMap: Readonly<Record<string, number>> = KEY_CODE_TO_LANE;
+  private keysValue: readonly LaneKey[] = LANE_KEYS;
   /** pointerId -> lane, i.e. the touch half of "who is holding what". */
   private readonly pointerLanes = new Map<number, number>();
   /**
@@ -138,6 +155,28 @@ export class InputManager {
     this.pointerUpHandler = (event) => this.handlePointerEnd(event, 'up');
     this.pointerCancelHandler = (event) => this.handlePointerEnd(event, 'cancel');
     this.pointerCaptureHandler = (event) => this.handlePointerEnd(event, 'lostcapture');
+  }
+
+  /**
+   * Install the key map and lane count of a difficulty.
+   *
+   * Everything held is released first: a lane that exists on Hard and not on Easy must not survive
+   * the switch as a stuck "down" state, and a press that started before the switch is not a press
+   * on the new chart. The tracker is rebuilt rather than resized so its lane validity always agrees
+   * with the lane count — a four-lane chart cannot report lane 6 as pressed.
+   */
+  setKeyLayout(layout: KeyLayout): void {
+    const laneCount = Math.max(1, Math.round(layout.laneCount) || LANE_KEYS.length);
+    if (laneCount === this.tracker.laneCount && layout.keys === this.keysValue) return;
+    this.releaseAll();
+    this.tracker = new LanePressTracker(laneCount);
+    this.keysValue = layout.keys;
+    this.keyMap = keyMapFor(layout.keys);
+  }
+
+  /** Lanes the current layout listens on. */
+  get laneCount(): number {
+    return this.tracker.laneCount;
   }
 
   attach(): void {
@@ -269,9 +308,24 @@ export class InputManager {
     for (const lane of wasDown) this.callbacks.onLaneVisual?.(lane, false);
   }
 
-  /** Lane key labels for the HUD, in lane order. */
+  /** Key labels of the active layout, in lane order. */
+  labels(): string[] {
+    return this.keysValue.map((entry) => entry.label);
+  }
+
+  /** Lane key labels of the default (seven-key) layout. Kept for tests and older callers. */
   static keyLabels(): string[] {
     return LANE_KEYS.map((entry) => entry.label);
+  }
+
+  /** Fallback labels for a lane count, without an `InputManager` instance. */
+  static labelsForLaneCount(laneCount: number): string[] {
+    return keyLabelsFor(laneCount);
+  }
+
+  /** Lanes the tracker currently knows about (used by tests and the debug snapshot). */
+  get laneCountValue(): number {
+    return laneProfileFor(this.tracker.laneCount).laneCount;
   }
 
   // ------------------------------------------------------------------ touch ---
@@ -352,7 +406,13 @@ export class InputManager {
   // ---------------------------------------------------------------- keyboard ---
 
   private handleKeyDown(event: KeyboardEvent): void {
-    const lane = KEY_CODE_TO_LANE[event.code];
+    // Typing belongs to the field it is aimed at. This check used to run *after* the lane handling,
+    // which meant the letters that are lane keys (A S D J K L, and SPACE) could never be typed into
+    // the import panel's title box — and with phase 3's all-difficulty suppression that would have
+    // grown to every lane key of every layout.
+    if (this.isFormTarget(event.target)) return;
+
+    const lane = this.keyMap[event.code];
 
     if (lane !== undefined) {
       // Stop SPACE from scrolling and the letters from typing, even when input is disabled.
@@ -369,7 +429,13 @@ export class InputManager {
       return;
     }
 
-    if (this.isFormTarget(event.target)) return;
+    // A key that belongs to *another* difficulty still belongs to the game: on a four-lane chart
+    // SPACE and D are not lanes, but letting SPACE scroll the page while the player mashes it would
+    // be a bug. Only the preventDefault applies; the press is ignored.
+    if (ALL_LANE_KEY_CODES.includes(event.code)) {
+      event.preventDefault();
+      return;
+    }
 
     if (event.code === 'Escape') {
       event.preventDefault();
@@ -381,8 +447,11 @@ export class InputManager {
   }
 
   private handleKeyUp(event: KeyboardEvent): void {
-    const lane = KEY_CODE_TO_LANE[event.code];
-    if (lane === undefined) return;
+    const lane = this.keyMap[event.code];
+    if (lane === undefined) {
+      if (ALL_LANE_KEY_CODES.includes(event.code)) event.preventDefault();
+      return;
+    }
     event.preventDefault();
     const release = this.tracker.release(LanePressTracker.keyboardSource(event.code));
     if (!release) return; // another source (a finger) still holds this lane

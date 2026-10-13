@@ -11,10 +11,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#05070d" />
     <meta name="mobile-web-app-capable" content="yes" />
-    <title>Seven Keys — O2Jam-inspired seven-key rhythm game</title>
+    <title>Groove — 4/5/7-key falling-note rhythm game</title>
     <meta
       name="description"
-      content="Seven Keys: an original seven-key falling-note rhythm game demo built with TypeScript, Vite and Three.js."
+      content="Groove: an original falling-note rhythm game with Easy (4 keys), Normal (5 keys) and Hard (7 keys) charts generated from your own music, built with TypeScript, Vite and Three.js."
     />
     <link rel="icon" href="data:," />
   </head>
@@ -25,7 +25,7 @@
       Element ids are part of a contract: src/ui/dom.ts throws at startup if any is missing.
     -->
     <div id="stage">
-      <canvas id="game-canvas" aria-label="Seven-lane note highway"></canvas>
+      <canvas id="game-canvas" aria-label="Note highway"></canvas>
 
       <!--
         Touch lane columns (phase 1.5). Built and positioned by src/ui/TouchSurface.ts from
@@ -64,6 +64,8 @@
           <div class="stat"><span class="stat-label">bad</span><span id="stat-bad">0</span></div>
           <div class="stat"><span class="stat-label">miss</span><span id="stat-miss">0</span></div>
           <div class="stat"><span class="stat-label">holds kept</span><span id="stat-holds">0</span></div>
+          <div class="stat"><span class="stat-label">difficulty</span><span id="stat-difficulty">hard · 7 keys</span></div>
+          <div class="stat"><span class="stat-label">max score</span><span id="stat-maxscore">--</span></div>
         </div>
 
         <div class="combo" id="hud-combo" data-visible="false">
@@ -88,17 +90,19 @@
       <!-- Overlays: loading / ready / pause / results -->
       <div id="overlay" class="layer">
         <section class="panel" id="panel-loading">
-          <h1 class="brand">Seven<span>Keys</span></h1>
+          <h1 class="brand">Groove</h1>
           <p class="lead" id="loading-status">Preparing the demo track…</p>
           <div class="progress progress-lg"><div class="progress-fill" id="loading-progress"></div></div>
           <p class="fine">The demo song is synthesised locally in your browser — no audio file is downloaded.</p>
         </section>
 
         <section class="panel" id="panel-ready" hidden>
-          <h1 class="brand">Seven<span>Keys</span></h1>
+          <h1 class="brand">Groove</h1>
           <p class="lead">
-            Seven lanes. <strong>A S D</strong> · <strong>Space</strong> · <strong>J K L</strong>. Hit the notes as they
-            cross the hit line. Holds must stay pressed until the tail arrives.
+            Three difficulties. <strong>Easy</strong> is four keys (<strong>A S K L</strong>), <strong>Normal</strong> is
+            five (<strong>A S Space K L</strong>) and <strong>Hard</strong> is seven
+            (<strong>A S D Space J K L</strong>). Hit the notes as they cross the hit line; holds must stay pressed
+            until the tail arrives.
           </p>
 
           <div class="settings">
@@ -122,6 +126,19 @@
               <input type="range" id="setting-volume" min="0" max="100" step="5" value="70" />
               <span class="setting-hint">Master output for the demo track and hit feedback.</span>
             </label>
+
+            <label class="setting">
+              <span class="setting-title">Lane colours</span>
+              <!--
+                Two three-colour themes (see LANE_PALETTES in src/renderer/Layout.ts, which is the
+                only definition of the colours). Options are built from that catalogue at startup.
+              -->
+              <select id="setting-palette"></select>
+              <span class="setting-hint">
+                Three colours for the whole highway: colour 1 on the outer lanes, colour 2 on the inner lanes, and
+                orange for SPACE — the key that means the beat. Saved on this device.
+              </span>
+            </label>
           </div>
 
           <div class="panel-actions">
@@ -133,9 +150,10 @@
           </div>
           <p class="fine">
             Pick a local MP3 and the analyser estimates the tempo, measures how well the beat grid matches the music,
-            finds the onsets and builds a seven-lane chart you can play straight away. After importing, Diagnostics
-            shows the numbers and an onset / beat / note timeline you can play back with clicks over the music. The demo
-            chart stays available for comparison.
+            finds the onsets and builds <strong>three charts from that one analysis</strong> — Easy, Normal and Hard.
+            All three are saved with the song, so switching difficulty never re-analyses anything. After importing,
+            Diagnostics shows the numbers and an onset / beat / note timeline you can play back with clicks over the
+            music. The hand-authored demo chart stays available for comparison.
           </p>
         </section>
 
@@ -202,8 +220,18 @@
               <div class="import-stat"><span>analysis time</span><strong id="import-stat-analysis">--</strong></div>
             </div>
             <div class="import-warnings" id="import-warnings" hidden></div>
+
+            <!--
+              Difficulty selector (phase 3): one card per difficulty, built by ImportPanel from the
+              chart set the import produced. Each card shows the lanes, note count, density, score
+              weight, theoretical maximum and stored best — all read from the chart it would load.
+            -->
+            <h3 class="import-heading">Choose a difficulty</h3>
+            <div class="difficulty-grid" id="difficulty-options"></div>
+            <div class="difficulty-note fine" id="difficulty-note" hidden></div>
+
             <div class="panel-actions">
-              <button type="button" class="btn btn-primary" id="btn-import-play">Play this chart</button>
+              <button type="button" class="btn btn-primary" id="btn-import-play">Play the default chart</button>
               <button type="button" class="btn" id="btn-diagnostics">Advanced diagnostics</button>
               <button type="button" class="btn btn-ghost" id="btn-import-back">Back</button>
             </div>
@@ -260,6 +288,15 @@
         <section class="panel" id="panel-pause" hidden>
           <h2 class="panel-title">Paused</h2>
           <p class="lead">The audio clock is frozen. Notes resume exactly where they stopped.</p>
+          <!--
+            Difficulty switch (phase 3): every difficulty of the current song is already generated
+            and saved, so changing it here restarts the run on the other chart with no re-analysis
+            and no re-decode. Rendered by GameApp; empty and hidden for the demo chart.
+          -->
+          <div class="pause-difficulty" id="pause-difficulty" hidden>
+            <span class="setting-title">Difficulty</span>
+            <div class="pause-difficulty-options" id="pause-difficulty-options"></div>
+          </div>
           <div class="panel-actions">
             <button type="button" class="btn btn-primary" id="btn-resume">Resume <kbd>Esc</kbd></button>
             <button type="button" class="btn" id="btn-restart-2">Restart <kbd>R</kbd></button>
@@ -287,6 +324,10 @@
               <tr><th>Holds broken</th><td id="result-holds-broken">0</td></tr>
               <tr><th>Stray presses</th><td id="result-stray">0</td></tr>
               <tr><th>Notes</th><td id="result-notes">0</td></tr>
+              <tr><th>Difficulty</th><td id="result-difficulty">--</td></tr>
+              <tr><th>Score weight</th><td id="result-weight">--</td></tr>
+              <tr><th>Maximum score</th><td id="result-maxscore">--</td></tr>
+              <tr><th>Best (same difficulty)</th><td id="result-best">--</td></tr>
             </tbody>
           </table>
           <div class="panel-actions">
@@ -306,7 +347,7 @@
           <div class="rotate-icon" aria-hidden="true"><span></span></div>
           <h2 class="panel-title" id="rotate-title">Rotate your device</h2>
           <p class="lead">
-            Seven Keys plays in landscape: seven lane columns need the full width of the screen, and
+            Groove plays in landscape: four to seven lane columns need the width of the screen, and
             the touch pads belong under your thumbs. Turn the phone sideways to keep playing.
           </p>
           <div class="panel-actions">

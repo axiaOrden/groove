@@ -13,7 +13,16 @@
  */
 
 import type { Beatmap, ChartNote } from './ChartTypes';
-import { BEATMAP_SCHEMA_VERSION, LANE_COUNT, isDifficulty, noteEndMs, roundMs, sortNotes } from './ChartTypes';
+import {
+  BEATMAP_SCHEMA_VERSION,
+  LANE_COUNT,
+  MIN_LANE_COUNT,
+  isDifficulty,
+  lanesOf,
+  noteEndMs,
+  roundMs,
+  sortNotes,
+} from './ChartTypes';
 
 export type IssueSeverity = 'error' | 'warning';
 
@@ -95,6 +104,21 @@ export function validateBeatmap(map: Beatmap, options: ValidationOptions = {}): 
   if (!Number.isFinite(map.generator?.seed)) {
     warnings.push(issue('warning', 'generator-seed', 'generator.seed is missing or not finite'));
   }
+  if (map.laneCount !== undefined) {
+    if (!Number.isInteger(map.laneCount) || map.laneCount < MIN_LANE_COUNT || map.laneCount > LANE_COUNT) {
+      errors.push(
+        issue(
+          'error',
+          'lane-count',
+          `laneCount must be an integer in ${MIN_LANE_COUNT}..${LANE_COUNT}, got ${String(map.laneCount)}`,
+        ),
+      );
+    }
+  }
+
+  // Lane bounds are the chart's own lane count, so a four-lane chart cannot smuggle in a note on
+  // lane 6 (which the engine would have no key for). Charts without the field are seven lanes.
+  const lanes = lanesOf(map);
 
   let unsorted = false;
   let previousTime = -Infinity;
@@ -103,9 +127,9 @@ export function validateBeatmap(map: Beatmap, options: ValidationOptions = {}): 
     if (!Number.isFinite(note.timeMs) || note.timeMs < 0) {
       errors.push(issue('error', 'note-time', `note ${index}: timeMs must be finite and >= 0`, index));
     }
-    if (!Number.isInteger(note.lane) || note.lane < 0 || note.lane >= LANE_COUNT) {
+    if (!Number.isInteger(note.lane) || note.lane < 0 || note.lane >= lanes) {
       errors.push(
-        issue('error', 'note-lane', `note ${index}: lane ${note.lane} is outside 0..${LANE_COUNT - 1}`, index),
+        issue('error', 'note-lane', `note ${index}: lane ${note.lane} is outside 0..${lanes - 1}`, index),
       );
     }
     if (note.type !== 'tap' && note.type !== 'hold') {
@@ -128,13 +152,13 @@ export function validateBeatmap(map: Beatmap, options: ValidationOptions = {}): 
 
   // Same-lane checks operate on the sorted view so behaviour does not depend on input order.
   const sorted = sortNotes(map.notes);
-  const perLane: ChartNote[][] = Array.from({ length: LANE_COUNT }, () => []);
+  const perLane: ChartNote[][] = Array.from({ length: lanes }, () => []);
   for (const note of sorted) {
-    if (!Number.isInteger(note.lane) || note.lane < 0 || note.lane >= LANE_COUNT) continue;
+    if (!Number.isInteger(note.lane) || note.lane < 0 || note.lane >= lanes) continue;
     perLane[note.lane]!.push(note);
   }
 
-  for (let lane = 0; lane < LANE_COUNT; lane += 1) {
+  for (let lane = 0; lane < lanes; lane += 1) {
     const laneNotes = perLane[lane]!;
     for (let i = 1; i < laneNotes.length; i += 1) {
       const previous = laneNotes[i - 1]!;
@@ -218,6 +242,7 @@ export class ChartValidationError extends Error {
  * positive numbers. Returns a new object; the input is untouched.
  */
 export function normalizeBeatmap(map: Beatmap): Beatmap {
+  const laneCount = lanesOf(map);
   const notes: ChartNote[] = map.notes
     .filter((note): note is ChartNote => typeof note === 'object' && note !== null)
     .map((note) => {
@@ -235,6 +260,7 @@ export function normalizeBeatmap(map: Beatmap): Beatmap {
 
   return {
     ...map,
+    laneCount,
     offsetMs: Number.isFinite(map.offsetMs) ? map.offsetMs : 0,
     notes: sortNotes(notes),
   };

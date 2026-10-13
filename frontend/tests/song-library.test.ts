@@ -2,22 +2,32 @@
  * Library tests: the record schema, the conversion back into a playable chart, the untrusted-input
  * validation, and a full save → list → load → delete round trip through a store.
  *
+ * Phase 3 changed the stored shape: one record now carries a **map of charts** (easy / normal /
+ * hard) generated from a single analysis, and the version-1 shape (a single seven-key `chart`) is
+ * migrated to `charts.hard` on the way in. Both are covered here, because "previously imported music
+ * still plays" is a requirement, not a nicety.
+ *
  * The round trip here runs against `MemorySongStore`, which implements the same `SongStore`
  * interface as the IndexedDB store — the browser check covers the real database. What is asserted
- * where it matters is shape-independent: a saved song reopens **without re-analysis**, its chart
- * still validates, and its summary carries everything the picker shows.
+ * where it matters is shape-independent: a saved song reopens **without re-analysis**, its charts
+ * still validate, and its summary carries everything the picker shows.
  */
 
 import { describe, expect, it } from 'vitest';
 import { analyzeMono } from '../src/analysis/MusicAnalyzer';
-import { generateChart } from '../src/chart/ChartGenerator';
+import { generateChartSet } from '../src/chart/DifficultySet';
+import { CHART_DIFFICULTIES } from '../src/chart/Difficulty';
 import { validateBeatmap } from '../src/chart/ChartValidator';
 import type { Beatmap } from '../src/chart/ChartTypes';
 import {
+  buildSongRecord,
   chartOf,
+  chartSetOf,
   decodeSongRecord,
   encodeSongRecord,
   makeSongId,
+  primaryDifficulty,
+  recordDifficulties,
   SONG_RECORD_VERSION,
   SongRecordError,
   summarize,
@@ -29,60 +39,59 @@ import { clickTrack, drumTrack, RATE } from './helpers/synth';
 
 interface Fixture {
   record: SongRecord;
-  chart: Beatmap;
+  charts: Record<string, Beatmap>;
 }
 
+const FACTS = { name: 'My Song.mp3', sizeBytes: 4_100_000, lastModified: 1_700_000_000_000 };
+
+/** A full phase-3 record: one analysis, three generated charts, saved as a version-2 record. */
 function fixture(seed = 5): Fixture {
   const analysis = analyzeMono(drumTrack({ durationMs: 14000, bpm: 120 }), RATE);
-  const facts = { name: 'My Song.mp3', sizeBytes: 4_100_000, lastModified: 1_700_000_000_000 };
-  const id = makeSongId(facts, analysis.durationMs);
-  const generated = generateChart(analysis, { seed, songId: id, title: 'My Song', artist: 'Someone' });
-  const record = {
-    recordVersion: SONG_RECORD_VERSION,
+  const id = makeSongId(FACTS, analysis.durationMs);
+  const set = generateChartSet(analysis, { seed, songId: id, title: 'My Song', artist: 'Someone' });
+  const record = buildSongRecord({
     id,
     title: 'My Song',
     artist: 'Someone',
-    fileName: facts.name,
-    fileSize: facts.sizeBytes,
-    durationMs: analysis.durationMs,
-    sampleRate: analysis.sampleRate,
-    channels: 2,
-    bpm: analysis.bpm,
-    beatMs: analysis.beatMs,
-    firstBeatMs: analysis.firstBeatMs,
-    beatConfidence: analysis.beatConfidence,
-    analysis: {
-      version: analysis.version,
-      analysisMs: analysis.analysisMs,
-      framesAnalyzed: analysis.framesAnalyzed,
-      hopMs: analysis.hopMs,
-      onsetCount: analysis.onsets.length,
-      beatCount: analysis.beats.length,
-      lowEnergySections: analysis.energy.lowEnergyRanges.length,
-      warnings: [...analysis.warnings],
-      tempoCandidates: [...analysis.tempoCandidates],
-      beatAlignRatio: analysis.beatAlignRatio,
-      beatAlignChance: analysis.beatAlignChance,
-      gridCoverage: analysis.gridCoverage,
-      gridExcess: analysis.gridExcess,
-      barPhase: analysis.barPhase,
-      sections: [...analysis.sections],
-      lowConfidenceRanges: [...analysis.lowConfidenceRanges],
+    fileName: FACTS.name,
+    fileSize: FACTS.sizeBytes,
+    audio: {
+      format: 'mp3',
+      mimeType: 'audio/mpeg',
+      bytes: FACTS.sizeBytes,
+      stored: true,
+      transcoded: false,
     },
+    analysis,
+    charts: set.charts,
+    now: () => new Date('2026-10-13T10:00:00.000Z'),
+  });
+  const charts: Record<string, Beatmap> = {};
+  for (const difficulty of CHART_DIFFICULTIES) {
+    const entry = set.charts[difficulty];
+    if (entry) charts[difficulty] = entry.chart;
+  }
+  return { record, charts };
+}
+
+/** A stored song from before phase 3: one seven-key chart under the old `chart` key. */
+function legacyRecord(fixtureSource = fixture()): Record<string, unknown> {
+  const { record, charts } = fixtureSource;
+  const hard = charts.hard!;
+  return {
+    ...record,
+    recordVersion: 1,
+    charts: undefined,
     chart: {
-      schemaVersion: generated.chart.schemaVersion,
-      difficulty: generated.chart.difficulty,
-      generator: { ...generated.chart.generator },
-      noteCount: generated.chart.notes.length,
-      notes: generated.chart.notes.map((note) => ({ ...note })),
-      stats: { ...generated.stats },
-      validation: { ok: generated.validation.ok, errors: [], warnings: [] },
+      schemaVersion: hard.schemaVersion,
+      difficulty: 'normal',
+      generator: { ...hard.generator },
+      noteCount: hard.notes.length,
+      notes: hard.notes.map((note) => ({ ...note })),
+      stats: { ...record.charts.hard!.stats },
+      validation: { ok: true, errors: [], warnings: [] },
     },
-    audio: { format: 'mp3' as const, mimeType: 'audio/mpeg', bytes: facts.sizeBytes, stored: true, transcoded: false },
-    createdAt: '2026-10-13T10:00:00.000Z',
-    updatedAt: '2026-10-13T10:00:00.000Z',
-  } satisfies SongRecord;
-  return { record, chart: generated.chart };
+  };
 }
 
 describe('song ids and titles', () => {
@@ -103,36 +112,92 @@ describe('song ids and titles', () => {
 });
 
 describe('record → chart', () => {
+  it('stores all three difficulties from one analysis', () => {
+    const { record, charts } = fixture();
+    expect(recordDifficulties(record)).toEqual(['easy', 'normal', 'hard']);
+    expect(record.charts.easy!.laneCount).toBe(4);
+    expect(record.charts.normal!.laneCount).toBe(5);
+    expect(record.charts.hard!.laneCount).toBe(7);
+    // Each chart's notes belong to its own lane count — nothing was copied from Hard and cut down.
+    expect(charts.easy!.notes.length).toBeLessThan(charts.hard!.notes.length);
+    expect(Math.max(...charts.easy!.notes.map((note) => note.lane))).toBeLessThan(4);
+    expect(Math.max(...charts.normal!.notes.map((note) => note.lane))).toBeLessThan(5);
+  });
+
   it('rebuilds the exact chart without any analysis', () => {
-    const { record, chart } = fixture();
-    const rebuilt = chartOf(record);
-    expect(rebuilt.notes).toEqual(chart.notes);
-    expect(rebuilt.bpm).toBe(chart.bpm);
-    expect(rebuilt.songId).toBe(record.id);
-    expect(rebuilt.difficulty).toBe('normal');
-    expect(validateBeatmap(rebuilt).ok).toBe(true);
+    const { record, charts } = fixture();
+    for (const difficulty of CHART_DIFFICULTIES) {
+      const rebuilt = chartOf(record, difficulty);
+      expect(rebuilt.notes).toEqual(charts[difficulty]!.notes);
+      // Tempo comes from the stored record, so the rebuilt chart keeps the analysed BPM exactly.
+      expect(rebuilt.bpm).toBe(record.bpm);
+      expect(rebuilt.bpm).toBeGreaterThan(110);
+      expect(rebuilt.songId).toBe(record.id);
+      expect(rebuilt.difficulty).toBe(difficulty);
+      expect(validateBeatmap(rebuilt).ok).toBe(true);
+    }
+  });
+
+  it('opens a saved song on Hard, and that is what a legacy record has too', () => {
+    const { record } = fixture();
+    expect(primaryDifficulty(record)).toBe('hard');
+    expect(chartOf(record).difficulty).toBe('hard');
+    // Legacy records only ever had the seven-key chart, which is Hard (see the tests below).
+    const migrated = decodeSongRecord(legacyRecord());
+    expect(primaryDifficulty(migrated)).toBe('hard');
   });
 
   it('re-validates on the way out, so a corrupted note list cannot reach the engine', () => {
     const { record } = fixture();
     const corrupted: SongRecord = {
       ...record,
-      chart: { ...record.chart, notes: [{ timeMs: 1000, lane: 99, type: 'tap' }] },
+      charts: {
+        ...record.charts,
+        hard: { ...record.charts.hard!, notes: [{ timeMs: 1000, lane: 99, type: 'tap' }] },
+      },
     };
-    // `chartOf` throws (prepareBeatmap), and `validateRecord` reports instead of throwing.
-    expect(() => chartOf(corrupted)).toThrow();
+    // `chartOf` throws (prepareBeatmap), and `summarize` reports instead of throwing.
+    expect(() => chartOf(corrupted, 'hard')).toThrow();
     const summary = summarize(corrupted);
     expect(summary.validationOk).toBe(false);
+    expect(summary.charts.find((entry) => entry.difficulty === 'hard')!.validationOk).toBe(false);
+  });
+
+  it('rejects a note that belongs to another difficulty’s lane count', () => {
+    const { record } = fixture();
+    // A five-lane chart may not carry a lane-6 note: the player has no key for it.
+    const wrongLanes: SongRecord = {
+      ...record,
+      charts: {
+        ...record.charts,
+        normal: { ...record.charts.normal!, notes: [{ timeMs: 500, lane: 6, type: 'tap' }] },
+      },
+    };
+    expect(() => chartOf(wrongLanes, 'normal')).toThrow();
+    expect(validateBeatmap(chartOf(record, 'easy')).ok).toBe(true);
   });
 
   it('summarises for the library list without carrying the notes', () => {
     const { record } = fixture();
     const summary = summarize(record);
     expect(summary.title).toBe('My Song');
-    expect(summary.noteCount).toBe(record.chart.notes.length);
+    expect(summary.noteCount).toBe(record.charts.hard!.notes.length);
+    expect(summary.difficulty).toBe('hard');
+    expect(summary.difficulties).toEqual(['easy', 'normal', 'hard']);
+    expect(summary.charts.map((entry) => entry.laneCount)).toEqual([4, 5, 7]);
+    expect(summary.charts.map((entry) => entry.scoreWeight)).toEqual([1, 1.5, 2]);
+    expect(summary.charts.every((entry) => entry.maxScore > 0)).toBe(true);
     expect(summary.audio.format).toBe('mp3');
     expect('notes' in summary).toBe(false);
     expect(summary.validationOk).toBe(true);
+  });
+
+  it('exposes the same charts as a chart set, for the difficulty switcher', () => {
+    const { record } = fixture();
+    const set = chartSetOf(record);
+    expect(Object.keys(set.charts).sort()).toEqual(['easy', 'hard', 'normal']);
+    expect(set.charts.normal!.chart.laneCount).toBe(5);
+    expect(set.charts.easy!.validation.ok).toBe(true);
   });
 });
 
@@ -159,9 +224,9 @@ describe('record serialisation', () => {
       [{ ...record, title: '' }, /no title/],
       [{ ...record, bpm: 0 }, /no usable tempo/],
       [{ ...record, beatMs: 0 }, /no usable beat length/],
-      [{ ...record, chart: { ...record.chart, notes: [] } }, /no chart notes/],
-      [{ ...record, chart: { ...record.chart, difficulty: 'insane' } }, /unknown difficulty/],
-      [{ ...record, chart: { ...record.chart, schemaVersion: 99 } }, /schema v99/],
+      [{ ...record, charts: { hard: { ...record.charts.hard!, notes: [] } } }, /no chart notes/],
+      [{ ...record, charts: { insane: record.charts.hard } }, /unknown difficulty/],
+      [{ ...record, charts: { hard: { ...record.charts.hard!, schemaVersion: 99 } } }, /schema v99/],
     ];
     for (const [value, pattern] of cases) {
       expect(() => decodeSongRecord(value)).toThrow(SongRecordError);
@@ -170,10 +235,45 @@ describe('record serialisation', () => {
   });
 });
 
+describe('legacy (version 1) records', () => {
+  it('migrates the single seven-key chart to hard and leaves the others absent', () => {
+    const { charts } = fixture();
+    const migrated = decodeSongRecord(legacyRecord());
+    expect(migrated.recordVersion).toBe(1);
+    expect(recordDifficulties(migrated)).toEqual(['hard']);
+    expect(migrated.charts.hard!.laneCount).toBe(7);
+    // The notes survive the migration byte for byte, so an old song plays exactly as it did.
+    expect(chartOf(migrated, 'hard').notes).toEqual(charts.hard!.notes);
+    expect(validateBeatmap(chartOf(migrated, 'hard')).ok).toBe(true);
+  });
+
+  it('does not invent the missing difficulties from a chart that has no analysis', () => {
+    const migrated = decodeSongRecord(legacyRecord());
+    expect(migrated.charts.easy).toBeUndefined();
+    expect(migrated.charts.normal).toBeUndefined();
+    // Asking for one is a readable error rather than an empty chart.
+    expect(() => chartOf(migrated, 'easy')).toThrow(/no easy chart/);
+    // ...and the set simply does not contain it, which is how the picker reports "unavailable".
+    expect(Object.keys(chartSetOf(migrated).charts)).toEqual(['hard']);
+  });
+
+  it('keeps a migrated record valid for the summary and the diagnostics panel', () => {
+    const migrated = decodeSongRecord(legacyRecord());
+    const summary = summarize(migrated);
+    expect(summary.difficulties).toEqual(['hard']);
+    expect(summary.charts[0]!.noteCount).toBeGreaterThan(0);
+    expect(summary.validationOk).toBe(true);
+    // Pre-phase-3 analysis metadata is zeroed rather than invented.
+    const noAnalysis = decodeSongRecord({ ...legacyRecord(), analysis: undefined });
+    expect(noAnalysis.analysis.beatAlignRatio).toBe(0);
+    expect(noAnalysis.analysis.sections).toEqual([]);
+  });
+});
+
 describe('MemorySongStore round trip', () => {
   it('saves, lists, loads and deletes', async () => {
     const store = new MemorySongStore();
-    const { record } = fixture();
+    const { record, charts } = fixture();
     const audio = new Blob([new Uint8Array([1, 2, 3, 4])], { type: 'audio/mpeg' });
     await store.save(record, { id: record.id, blob: audio, mimeType: 'audio/mpeg' });
 
@@ -181,19 +281,46 @@ describe('MemorySongStore round trip', () => {
     const list = await store.list();
     expect(list).toHaveLength(1);
     expect(list[0]!.id).toBe(record.id);
+    expect(list[0]!.difficulties).toEqual(['easy', 'normal', 'hard']);
 
     const loaded = await store.load(record.id);
     expect(loaded).not.toBeNull();
-    expect(loaded!.record.chart.notes).toEqual(record.chart.notes);
+    for (const difficulty of CHART_DIFFICULTIES) {
+      expect(loaded!.record.charts[difficulty]!.notes).toEqual(charts[difficulty]!.notes);
+      expect(chartOf(loaded!.record, difficulty).notes).toEqual(charts[difficulty]!.notes);
+    }
     expect(loaded!.audio).not.toBeNull();
     expect(loaded!.audio!.size).toBe(4);
-    // Reopening needs no analysis: the chart and the grid numbers are all present.
+    // Reopening needs no analysis: the charts and the grid numbers are all present.
     expect(loaded!.record.analysis.onsetCount).toBe(record.analysis.onsetCount);
-    expect(chartOf(loaded!.record).notes).toEqual(record.chart.notes);
+    expect(loaded!.record.analysis.sections.length).toBe(record.analysis.sections.length);
 
     await store.remove(record.id);
     expect(await store.count()).toBe(0);
     expect(await store.load(record.id)).toBeNull();
+  });
+
+  it('drops the song’s scores with the song', async () => {
+    const store = new MemorySongStore();
+    const { record } = fixture();
+    await store.save(record, null);
+    await store.scores.submit({
+      songId: record.id,
+      title: record.title,
+      difficulty: 'hard',
+      difficultyWeight: 2,
+      generatorVersion: '2.0.0',
+      score: 1234,
+      maxScore: 40000,
+      accuracy: 0.9,
+      grade: 'A',
+      maxCombo: 20,
+      totalNotes: 40,
+    });
+    expect(await store.scores.best(record.id, 'hard')).not.toBeNull();
+    await store.remove(record.id);
+    expect(await store.scores.best(record.id, 'hard')).toBeNull();
+    expect(await store.scores.attempts(record.id, 'hard')).toBe(0);
   });
 
   it('omits the audio when the player chose not to store it', async () => {
@@ -222,14 +349,17 @@ describe('MemorySongStore round trip', () => {
     expect(library.store.kind).toBe('memory');
     expect(library.store.persistent).toBe(false);
     expect(library.degradedReason).toMatch(/IndexedDB/);
+    // Scores have to work in the fallback too, or a session without IndexedDB could not play.
+    expect(library.store.scores).toBeDefined();
   });
 });
 
 describe('silent and very short material', () => {
-  it('produces a record that is honestly marked unplayable', async () => {
+  it('produces a record that is honestly marked unplayable', () => {
     const analysis = analyzeMono(new Float32Array(RATE * 3), RATE);
-    const generated = generateChart(analysis, { seed: 1, songId: 'silent', title: 'Silent' });
-    expect(generated.validation.ok).toBe(false);
+    const set = generateChartSet(analysis, { seed: 1, songId: 'silent', title: 'Silent' });
+    const hard = set.charts.hard!;
+    expect(hard.validation.ok).toBe(false);
     const { record } = fixture();
     const silentRecord: SongRecord = {
       ...record,
@@ -237,11 +367,13 @@ describe('silent and very short material', () => {
       title: 'Silent',
       bpm: analysis.bpm,
       beatMs: analysis.beatMs,
-      chart: {
-        ...record.chart,
-        noteCount: 0,
-        notes: [],
-        validation: { ok: false, errors: ['notes-empty: a beatmap needs at least one note'], warnings: [] },
+      charts: {
+        hard: {
+          ...record.charts.hard!,
+          noteCount: 0,
+          notes: [],
+          validation: { ok: false, errors: ['notes-empty: a beatmap needs at least one note'], warnings: [] },
+        },
       },
     };
     const summary = summarize(silentRecord);
@@ -255,8 +387,9 @@ describe('silent and very short material', () => {
 
   it('handles a very short track without pretending it is chartable', () => {
     const analysis = analyzeMono(clickTrack({ bpm: 120, durationMs: 2000 }), RATE);
-    const generated = generateChart(analysis, { seed: 1, songId: 'short', title: 'Short' });
-    expect(generated.stats.noteCount).toBeGreaterThan(0);
-    expect(generated.stats.notesPerSecond).toBeLessThan(8);
+    const set = generateChartSet(analysis, { seed: 1, songId: 'short', title: 'Short' });
+    const hard = set.charts.hard!;
+    expect(hard.stats.noteCount).toBeGreaterThan(0);
+    expect(hard.stats.notesPerSecond).toBeLessThan(8);
   });
 });

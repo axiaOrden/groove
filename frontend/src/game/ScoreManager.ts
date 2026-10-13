@@ -7,10 +7,21 @@
  *                 A completed hold does *not* add a second combo step: combo counts notes.
  *   multiplier    1 + 0.01 * min(combo, 100)  -> 1.0x at combo 0, 2.0x from combo 100 on.
  *   units         a tap is 1 unit, a hold is 2 units (head 1 + tail 1).
- *   points        round(basePoints[judgment] * units * multiplier)
- *                 PERFECT 300, GOOD 200, BAD 100, MISS 0.
- *   hold tail     awarded on completion using the head's judgment; forfeited when the hold is
- *                 released early, and forfeited without combo penalty when paused mid-hold.
+ *   points        round(basePoints[judgment] * units * multiplier * difficultyWeight)
+ *                 PERFECT 300, GOOD 200, BAD 100, MISS 0 at weight 1.
+ *   hold tail     awarded on completion using the head's judgment *and the head's combo multiplier*
+ *                 (so a hold is worth the same whether it is held to its tail or, within the
+ *                 release grace, let go early); forfeited when the hold is released early, and
+ *                 forfeited without combo penalty when paused mid-hold.
+ *
+ * The hold-tail rule is what makes the theoretical maximum exact: the score of a flawless run is
+ * `perfectRunScore(chart.notes)` (see `chart/ScoreModel`), which is also what a perfect play
+ * produces, so the score/max percentage reaches 100 %.
+ *
+ * **Difficulty weight (phase 3)**: Easy 1.0, Normal 1.5, Hard 2.0, applied to every award
+ * including hold tails. It is a *score* multiplier and nothing else — accuracy, combo and the
+ * judgment windows are untouched, so an Easy and a Hard run can be compared on accuracy, and the
+ * recorded score always carries the weight it was earned with (`ScoreEntry.difficultyWeight`).
  *
  * Accuracy is judgment-weighted and combo independent, which keeps it comparable between
  * runs and independent of where in a chart the mistakes happened:
@@ -23,6 +34,9 @@
 
 import type { JudgmentType, ScoreRules } from './GameConfig';
 import { DEFAULT_SCORE_RULES, gradeForAccuracy, isComboIncreasing, type Grade } from './GameConfig';
+import { difficultyProfile, type ChartDifficulty } from '../chart/Difficulty';
+import { awardPoints, comboMultiplier, perfectRunScore, DIFFICULTY_WEIGHTS } from '../chart/ScoreModel';
+import type { ChartNote } from '../chart/ChartTypes';
 
 export interface JudgmentCounts {
   perfect: number;
@@ -47,9 +61,25 @@ export interface ScoreSnapshot {
 export interface PlayResults extends ScoreSnapshot {
   grade: Grade;
   totalNotes: number;
-  /** Full theoretical score at this chart's note count, useful for progress bars. */
+  /** Note *units* judged: a tap is 1, a hold is 2 (head + tail). */
+  totalUnits: number;
+  /**
+   * Score of a flawless run of this chart: every note PERFECT, in chart order, every hold held to
+   * its tail — the same arithmetic the live scorer uses, so a perfect run reaches exactly this
+   * number (see `perfectRunScore` in `chart/ScoreModel.ts`).
+   */
   maxScore: number;
   finishedAtMs: number;
+  difficulty: ChartDifficulty;
+  /** The multiplier actually applied to every award in this run. */
+  difficultyWeight: number;
+}
+
+export interface ScoreManagerOptions {
+  /** Difficulty the run is played at; sets `difficultyWeight` when that is not given. */
+  difficulty?: ChartDifficulty;
+  /** Explicit score multiplier, overriding the difficulty's. */
+  difficultyWeight?: number;
 }
 
 export interface AwardBreakdown {
@@ -62,6 +92,8 @@ export interface AwardBreakdown {
 
 export class ScoreManager {
   private readonly rules: ScoreRules;
+  private readonly difficultyValue: ChartDifficulty;
+  private readonly weight: number;
   private scoreValue = 0;
   private comboValue = 0;
   private maxComboValue = 0;
@@ -73,8 +105,21 @@ export class ScoreManager {
   private judgedNotesValue = 0;
   private finishedAtMsValue = 0;
 
-  constructor(rules: ScoreRules = DEFAULT_SCORE_RULES) {
+  constructor(rules: ScoreRules = DEFAULT_SCORE_RULES, options: ScoreManagerOptions = {}) {
     this.rules = rules;
+    this.difficultyValue = options.difficulty ?? 'hard';
+    // With no difficulty named the weight stays 1, which keeps the pre-phase-3 arithmetic intact
+    // for callers that only care about the judgment model.
+    this.weight =
+      options.difficultyWeight ?? (options.difficulty ? difficultyProfile(options.difficulty).scoreWeight : 1);
+  }
+
+  get difficulty(): ChartDifficulty {
+    return this.difficultyValue;
+  }
+
+  get difficultyWeight(): number {
+    return this.weight;
   }
 
   get score(): number {
@@ -127,8 +172,13 @@ export class ScoreManager {
   }
 
   multiplierFor(combo: number): number {
-    const capped = Math.min(combo, this.rules.comboMultiplierCap);
-    return 1 + this.rules.comboMultiplierStep * capped;
+    return comboMultiplier(combo, this.rules);
+  }
+
+  /** Points for one award: the shared formula from `chart/ScoreModel`, so the maximum and the live
+   * score cannot disagree. */
+  pointsFor(judgment: JudgmentType, units: number, combo: number): number {
+    return awardPoints(judgment, units, combo, this.weight, this.rules);
   }
 
   /**
@@ -148,16 +198,20 @@ export class ScoreManager {
 
     // BAD breaks combo, so its multiplier is always 1; hits use the incremented combo.
     const multiplier = this.multiplierFor(this.comboValue);
-    const points = Math.round(this.rules.basePoints[judgment] * units * multiplier);
+    const points = this.pointsFor(judgment, units, this.comboValue);
     this.scoreValue += points;
 
     return { judgment, units, multiplier, points, combo: this.comboValue };
   }
 
-  /** Award the tail of a completed hold, using the head's judgment. */
-  awardHoldTail(judgment: JudgmentType, units = this.rules.holdWeight - 1): number {
-    const multiplier = this.multiplierFor(this.comboValue);
-    const points = Math.round(this.rules.basePoints[judgment] * units * multiplier);
+  /**
+   * Award the tail of a completed hold, using the head's judgment and (when the caller passes it)
+   * the combo the head was awarded at. Scoring the tail at the head's multiplier keeps a hold's
+   * value independent of when inside its release window the player let go.
+   */
+  awardHoldTail(judgment: JudgmentType, units = this.rules.holdWeight - 1, comboAtHead?: number): number {
+    const combo = comboAtHead !== undefined && Number.isFinite(comboAtHead) ? comboAtHead : this.comboValue;
+    const points = this.pointsFor(judgment, units, combo);
     this.scoreValue += points;
     this.holdCompletedValue += 1;
     return points;
@@ -194,17 +248,46 @@ export class ScoreManager {
     };
   }
 
-  results(totalNotes: number, finishedAtMs: number): PlayResults {
+  /**
+   * Final results.
+   *
+   * `extras.totalUnits` is the note *mix* of the chart (a hold is two units); it defaults to
+   * `totalNotes` so a caller with a tap-only chart does not have to compute it.
+   */
+  results(
+    totalNotes: number,
+    finishedAtMs: number,
+    extras: { notes?: readonly ChartNote[]; totalUnits?: number; difficulty?: ChartDifficulty } = {},
+  ): PlayResults {
     this.finishedAtMsValue = finishedAtMs;
-    const maxScore = Math.round(
-      totalNotes * this.rules.basePoints.perfect * this.multiplierFor(this.rules.comboMultiplierCap),
-    );
+    const unitCount = Number.isFinite(extras.totalUnits) ? Math.max(0, extras.totalUnits as number) : totalNotes;
+    // The maximum is a flawless run of the chart itself. When a caller only knows how many notes
+    // there are (the pre-phase-3 call shape), the notes are assumed to be taps, which is exactly the
+    // chart that shape describes.
+    const notes = extras.notes ?? tapNotesOf(totalNotes);
+    const maxScore = perfectRunScore(notes, this.weight, this.rules);
     return {
       ...this.snapshot(),
       grade: gradeForAccuracy(this.accuracy),
       totalNotes,
+      totalUnits: unitCount,
       maxScore,
       finishedAtMs: this.finishedAtMsValue,
+      difficulty: extras.difficulty ?? this.difficultyValue,
+      difficultyWeight: this.weight,
     };
   }
 }
+
+/** Tap-only notes for a count: the shape a caller who only knows `totalNotes` is describing. */
+function tapNotesOf(count: number): ChartNote[] {
+  const safe = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+  const notes: ChartNote[] = [];
+  for (let index = 0; index < safe; index += 1) {
+    notes.push({ timeMs: index * 1000, lane: 0, type: 'tap' });
+  }
+  return notes;
+}
+
+/** The weights, re-exported so the HUD/results screen and the docs read from one table. */
+export { DIFFICULTY_WEIGHTS };

@@ -1,22 +1,45 @@
 /**
- * Import panel — the phase 2 workflow, in the order the brief asks for it:
+ * Import panel — the import workflow, in the order the brief asks for it:
  *
  *   1. pick a file → 2. decode → 3. analyse (progress) → 4. show the analysis →
- *   5. generate + preview the count → 6. play it → 7. save it locally.
+ *   5. choose a difficulty → 6. play it → 7. save it locally.
  *
  * The panel owns no analysis or chart logic: it calls `importSongFile` (which is DOM-free and
  * tested in Node) and renders the result. Everything that can fail — an unreadable file, a
  * browser that cannot decode it, a song with no detectable pulse, a chart that fails validation,
  * a full private-mode database — surfaces as a readable message in `#import-error` rather than a
  * thrown exception or a silent no-op.
+ *
+ * Phase 3 changed step 5 from "press play" to "pick a difficulty". The selector is built from the
+ * chart set the import produced, so what each card shows (lane count, note count, notes per second,
+ * score weight, theoretical maximum, best score) is read from the chart that will actually be
+ * loaded — not from a table of claims about it. Selecting a card starts that chart at that lane
+ * count; nothing is re-analysed, and no lane is hidden to simulate a lower difficulty.
+ *
+ * A song saved before phase 3 has only a Hard chart (see `storage/SongRecord.ts`). Its cards for
+ * Easy and Normal are shown as **unavailable with an explicit offer to regenerate**: importing
+ * again, or re-running the analysis from the stored audio, is the only way to get those two charts
+ * that is honest about where they come from. That path lives here (`regenerateSong`) and is the
+ * "safe regeneration" the brief asks for.
  */
 
 import type { AnalysisClient } from '../analysis/AnalysisClient';
 import type { Beatmap } from '../chart/ChartTypes';
 import { prepareBeatmap } from '../chart/ChartValidator';
+import { CHART_DIFFICULTIES, difficultyProfile, isChartDifficulty, type ChartDifficulty } from '../chart/Difficulty';
+import {
+  availableDifficulties,
+  difficultySummary,
+  generateChartSet,
+  primaryChart,
+  type ChartSet,
+  type DifficultyChart,
+} from '../chart/DifficultySet';
+import { formatPercent } from './dom';
 import type { SongStore, SongSummary } from '../storage/SongLibrary';
-import { chartOf, type SongRecord } from '../storage/SongRecord';
-import { decodeAudioBlob, formatBytes, formatDuration, ImportError } from '../import/MusicImport';
+import { chartOf, chartSetOf, primaryChartOf, type SongRecord } from '../storage/SongRecord';
+import type { ScoreEntry } from '../storage/ScoreStore';
+import { decodeAudioBlob, describeFile, formatBytes, formatDuration, ImportError } from '../import/MusicImport';
 import { canTranscodeToOgg } from '../import/ImportFlow';
 import { estimateOggBytes } from '../import/OggExport';
 import { importSongFile, type ImportOutcome, type ImportProgress } from '../import/ImportFlow';
@@ -26,7 +49,10 @@ import { buildDiagnostics, type DiagnosticsData } from './DiagnosticsPanel';
 import { el, setHidden, setText } from './dom';
 
 export interface PlayableSong {
-  chart: Beatmap;
+  /** Every difficulty this song has, so the pause menu can switch without reloading. */
+  set: ChartSet;
+  /** Difficulty to open on. */
+  difficulty: ChartDifficulty;
   buffer: AudioBuffer;
   record: SongRecord | null;
   diagnostics: DiagnosticsData | null;
@@ -50,7 +76,7 @@ const STAGE_LABELS: Record<ImportProgress['stage'], string> = {
   validating: 'checking the file',
   decoding: 'decoding audio',
   analyzing: 'analysing music',
-  generating: 'generating the chart',
+  generating: 'generating the charts',
   transcoding: 'converting to OGG',
   saving: 'saving',
   done: 'done',
@@ -70,10 +96,15 @@ export class ImportPanel {
   private readonly results = el('import-results');
   private readonly analyzedTitle = el('import-analyzed-title');
   private readonly warnings = el('import-warnings');
+  private readonly difficultyOptions = el('difficulty-options');
+  private readonly difficultyNote = el('difficulty-note');
   private readonly libraryList = el('library-list');
   private readonly libraryNote = el('library-note');
 
   private outcome: ImportOutcome | null = null;
+  /** Set when the results section is showing a stored song rather than a fresh import. */
+  private storedSet: ChartSet | null = null;
+  private storedRecord: SongRecord | null = null;
   private busy = false;
   private oggAvailable: boolean | null = null;
 
@@ -97,13 +128,31 @@ export class ImportPanel {
     el('btn-import-back').addEventListener('click', () => this.deps.onBack());
     el('btn-diagnostics').addEventListener('click', () => this.emitDiagnostics());
     el('import-ogg').addEventListener('change', () => void this.refreshOggHint());
+    // One delegated listener for the whole difficulty grid: the cards are re-rendered per song, so
+    // binding per card would leak listeners across imports.
+    this.difficultyOptions.addEventListener('click', (event) => {
+      const target = event.target as HTMLElement | null;
+      const button = target?.closest('button[data-difficulty]') as HTMLButtonElement | null;
+      if (!button) return;
+      const difficulty = button.dataset.difficulty ?? '';
+      if (!isChartDifficulty(difficulty)) return;
+      if (button.dataset.action === 'regenerate') void this.regenerateStored(difficulty);
+      else void this.playDifficulty(difficulty);
+    });
     this.libraryList.addEventListener('click', (event) => {
       const target = event.target as HTMLElement | null;
       const button = target?.closest('button[data-action]') as HTMLButtonElement | null;
       const row = target?.closest('[data-song-id]') as HTMLElement | null;
       if (!button || !row) return;
       const id = row.dataset.songId ?? '';
-      if (button.dataset.action === 'play') void this.playFromLibrary(id);
+      if (button.dataset.action === 'play') {
+        const difficulty = button.dataset.difficulty ?? '';
+        void this.playFromLibrary(id, isChartDifficulty(difficulty) ? difficulty : undefined);
+      }
+      if (button.dataset.action === 'regenerate') {
+        const difficulty = button.dataset.difficulty ?? '';
+        if (isChartDifficulty(difficulty)) void this.regenerateFromLibrary(id, difficulty);
+      }
       if (button.dataset.action === 'diagnostics') void this.showLibraryDiagnostics(id);
       if (button.dataset.action === 'delete') void this.deleteFromLibrary(id);
     });
@@ -158,6 +207,8 @@ export class ImportPanel {
         onProgress: (progress) => setProgress(progress),
       });
       this.outcome = outcome;
+      this.storedSet = null;
+      this.storedRecord = null;
       this.renderOutcome(outcome);
       await this.refreshLibrary();
       this.emitDiagnostics(outcome);
@@ -171,7 +222,72 @@ export class ImportPanel {
     }
   }
 
-  async playFromLibrary(id: string): Promise<void> {
+  /** "Play this chart" — the card selected last, defaulting to the workflow's opening difficulty. */
+  private async playImported(): Promise<void> {
+    const outcome = this.outcome;
+    if (!outcome) {
+      this.setError('Import a song first.');
+      return;
+    }
+    const opening = primaryChart(outcome.set, outcome.set.charts.hard ? 'hard' : undefined);
+    if (opening === null) {
+      this.setError('This song has no playable chart.');
+      return;
+    }
+    let chart: Beatmap;
+    try {
+      chart = prepareBeatmap(opening.chart);
+    } catch (error) {
+      this.setError(describeError(error));
+      return;
+    }
+    this.deps.onPlay({
+      set: { ...outcome.set, charts: { ...outcome.set.charts, [opening.difficulty]: { ...outcome.set.charts[opening.difficulty]!, chart } } },
+      difficulty: opening.difficulty,
+      buffer: outcome.buffer,
+      record: outcome.record,
+      fromLibrary: false,
+      source: 'import',
+      diagnostics: buildDiagnostics({
+        source: outcome.record.title,
+        analysis: outcome.analysis,
+        chart,
+        stats: outcome.set.charts[opening.difficulty]!.stats,
+        validation: outcome.set.charts[opening.difficulty]!.validation,
+        chartWarnings: outcome.warnings,
+        audio: outcome.buffer,
+      }),
+    });
+  }
+
+  /** Play one difficulty from the results section (a card in `#difficulty-options`). */
+  private async playDifficulty(difficulty: ChartDifficulty): Promise<void> {
+    const record = this.storedRecord;
+    const set = this.storedSet ?? this.outcome?.set ?? null;
+    if (set === null) return;
+    const chart = set.charts[difficulty]?.chart;
+    if (!chart) {
+      this.setError('That difficulty is not available for this song.');
+      return;
+    }
+    if (this.outcome && record === null) {
+      // A fresh import still holds its decoded buffer, so playing needs no database round trip.
+      this.deps.onPlay({
+        set,
+        difficulty,
+        buffer: this.outcome.buffer,
+        record: this.outcome.record,
+        fromLibrary: false,
+        source: 'import',
+        diagnostics: this.diagnosticsFor(this.outcome.record.title, set, difficulty, this.outcome.analysis, this.outcome.buffer, this.outcome.warnings),
+      });
+      return;
+    }
+    if (record === null) return;
+    await this.playStored(record, difficulty, null);
+  }
+
+  async playFromLibrary(id: string, difficulty?: ChartDifficulty): Promise<void> {
     if (this.busy) return;
     this.setError(null);
     this.busy = true;
@@ -187,22 +303,9 @@ export class ImportPanel {
         );
         return;
       }
-      const context = await this.deps.getContext();
-      const buffer = await decodeAudioBlob(loaded.audio, context);
-      const chart = chartOf(loaded.record);
-      this.deps.onPlay({
-        chart,
-        buffer,
-        record: loaded.record,
-        fromLibrary: true,
-        source: 'library',
-        diagnostics: buildDiagnostics({
-          source: `${loaded.record.title} (from the library, no re-analysis)`,
-          chart,
-          stats: loaded.record.chart.stats,
-          chartWarnings: loaded.record.analysis.warnings,
-        }),
-      });
+      this.renderStoredSummary(loaded.record);
+      this.deps.onDiagnostics(this.diagnosticsForRecord(loaded.record, loaded.audio, difficulty));
+      await this.playStored(loaded.record, difficulty, loaded.audio);
     } catch (error) {
       this.setError(describeError(error));
     } finally {
@@ -210,13 +313,45 @@ export class ImportPanel {
     }
   }
 
+  /** Decode the stored audio and hand the chosen chart to the game. */
+  private async playStored(record: SongRecord, difficulty?: ChartDifficulty, blobHint?: Blob | null): Promise<void> {
+    const wanted = difficulty ?? primaryChartOf(record).difficulty;
+    const info = record.charts[wanted];
+    if (!info) {
+      this.setError(
+        `“${record.title}” has no ${wanted} chart. It was saved before phase 3 — use “Regenerate ${wanted}” to build ` +
+          'it from the stored audio (this re-analyses the song once).',
+      );
+      return;
+    }
+    const blob = blobHint ?? (await this.deps.store.load(record.id))?.audio ?? null;
+    if (!blob) {
+      this.setError(
+        `“${record.title}” was saved without its audio, so it cannot be played. Import the file again to play it.`,
+      );
+      return;
+    }
+    const context = await this.deps.getContext();
+    const buffer = await decodeAudioBlob(blob, context);
+    const set = chartSetOf(record, record.analysis.warnings);
+    this.deps.onPlay({
+      set,
+      difficulty: wanted,
+      buffer,
+      record,
+      fromLibrary: true,
+      source: 'library',
+      diagnostics: this.diagnosticsForRecord(record, blob, wanted),
+    });
+  }
+
   /**
    * Reopen the diagnostics for a song that is already saved.
    *
    * No analysis is repeated: the record holds the tempo, the grid numbers, the measured alignment
-   * and the chart, so the report and the timeline can be rebuilt from the database alone. The audio
-   * is only decoded when the song was stored with its bytes, and even then it is decoded for the
-   * section preview, never re-analysed.
+   * and every chart, so the report and the timeline can be rebuilt from the database alone. The
+   * audio is only decoded when the song was stored with its bytes, and even then it is decoded for
+   * the section preview, never re-analysed.
    */
   async showLibraryDiagnostics(id: string): Promise<void> {
     this.setError(null);
@@ -226,33 +361,125 @@ export class ImportPanel {
         this.setError('That song is no longer in the library.');
         return;
       }
-      const chart = chartOf(loaded.record);
-      const blob = loaded.audio;
       // The report has to be *visible*: this panel's results section is where the diagnostics live,
       // and for a song reopened from the library no import happened in this session.
-      this.renderStoredSummary(loaded.record, chart);
-      this.deps.onDiagnostics(
-        buildDiagnostics({
-          source: `${loaded.record.title} (from the library, no re-analysis)`,
-          analysis: storedAnalysisView(loaded.record),
-          onsetsStored: false,
-          chart,
-          stats: loaded.record.chart.stats,
-          chartWarnings: loaded.record.analysis.warnings,
-          // Decoded only when the player presses play in the preview: opening the report must be
-          // instant even for a ten-minute song.
-          ...(blob
-            ? {
-                loadAudio: async () => {
-                  const context = await this.deps.getContext();
-                  return decodeAudioBlob(blob, context);
-                },
-              }
-            : {}),
-        }),
-      );
+      this.renderStoredSummary(loaded.record);
+      this.deps.onDiagnostics(this.diagnosticsForRecord(loaded.record, loaded.audio));
     } catch (error) {
       this.setError(describeError(error));
+    }
+  }
+
+  /**
+   * Build a missing difficulty from the stored audio.
+   *
+   * This is the migration path for a phase-2 record (Hard only). It re-runs the analysis **once**
+   * on the stored bytes and regenerates the *whole* set, then saves the upgraded record — so the
+   * next time the song opens there is no work to do at all. The panel says so before and after,
+   * because "this will take a few seconds and re-analyse the song" is something the player deserves
+   * to be told.
+   */
+  private async regenerateStored(difficulty: ChartDifficulty): Promise<void> {
+    const record = this.storedRecord ?? this.outcome?.record ?? null;
+    if (record === null) return;
+    await this.regenerate(record, difficulty);
+  }
+
+  private async regenerateFromLibrary(id: string, difficulty: ChartDifficulty): Promise<void> {
+    if (this.busy) return;
+    const loaded = await this.deps.store.load(id);
+    if (!loaded) {
+      this.setError('That song is no longer in the library.');
+      return;
+    }
+    await this.regenerate(loaded.record, difficulty);
+  }
+
+  private async regenerate(record: SongRecord, difficulty: ChartDifficulty): Promise<void> {
+    if (this.busy) return;
+    const blob = (await this.deps.store.load(record.id))?.audio ?? null;
+    if (!blob) {
+      this.setError(
+        `“${record.title}” was saved without its audio, so its ${difficulty} chart cannot be rebuilt. Import the file again.`,
+      );
+      return;
+    }
+    this.busy = true;
+    this.setError(null);
+    setHidden(this.progressWrap, false);
+    setText(this.fileName, `${record.title} · rebuilding ${difficulty}`);
+    setProgress({ stage: 'analyzing', ratio: 0.05, detail: 're-analysing the stored audio' });
+    try {
+      const context = await this.deps.getContext();
+      const buffer = await decodeAudioBlob(blob, context);
+      const channels: Float32Array[] = [];
+      for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+        // Copies, not views: the worker transport detaches whatever it is given (see MusicImport).
+        channels.push(Float32Array.from(buffer.getChannelData(channel)));
+      }
+      setProgress({ stage: 'analyzing', ratio: 0.2, detail: 'analysing music' });
+      const { result: analysis } = await this.deps.client.analyze({
+        sampleRate: buffer.sampleRate,
+        channels,
+        onProgress: (progress) =>
+          setProgress({ stage: 'analyzing', ratio: 0.2 + progress.ratio * 0.6, detail: progress.detail ?? 'analysing' }),
+      });
+      setProgress({ stage: 'generating', ratio: 0.85, detail: 'generating charts' });
+      const seed = record.charts.hard?.generator.seed ?? 1;
+      const set = generateChartSet(analysis, {
+        seed,
+        songId: record.id,
+        title: record.title,
+        ...(record.artist ? { artist: record.artist } : {}),
+        charter: 'automatic analysis (phase 3, regenerated)',
+        durationMs: analysis.durationMs,
+      });
+      const primary = primaryChart(set);
+      if (primary === null) throw new Error('the regenerated chart set is empty');
+      const updated: SongRecord = {
+        ...record,
+        recordVersion: 2,
+        bpm: analysis.bpm,
+        beatMs: analysis.beatMs,
+        firstBeatMs: analysis.firstBeatMs,
+        beatConfidence: analysis.beatConfidence,
+        durationMs: Math.round(analysis.durationMs * 1000) / 1000,
+        analysis: {
+          version: analysis.version,
+          analysisMs: analysis.analysisMs,
+          framesAnalyzed: analysis.framesAnalyzed,
+          hopMs: analysis.hopMs,
+          onsetCount: analysis.onsets.length,
+          beatCount: analysis.beats.length,
+          lowEnergySections: analysis.energy.lowEnergyRanges.length,
+          warnings: [...analysis.warnings],
+          tempoCandidates: [...analysis.tempoCandidates],
+          beatAlignRatio: analysis.beatAlignRatio,
+          beatAlignChance: analysis.beatAlignChance,
+          gridCoverage: analysis.gridCoverage,
+          gridExcess: analysis.gridExcess,
+          barPhase: { ...analysis.barPhase, scores: [...analysis.barPhase.scores] },
+          sections: analysis.sections.map((section) => ({ ...section })),
+          lowConfidenceRanges: analysis.lowConfidenceRanges.map((range) => ({ ...range })),
+        },
+        charts: Object.fromEntries(
+          CHART_DIFFICULTIES.filter((entry) => set.charts[entry] !== undefined).map((entry) => [
+            entry,
+            chartInfoOf(set.charts[entry]!),
+          ]),
+        ) as SongRecord['charts'],
+        updatedAt: new Date().toISOString(),
+      };
+      await this.deps.store.save(updated, { id: record.id, blob, mimeType: record.audio.mimeType });
+      setProgress({ stage: 'done', ratio: 1, detail: `saved — ${difficulty} is ready` });
+      setText(this.fileName, `${record.title} · ${formatBytes(blob.size)}`);
+      await this.refreshLibrary();
+      this.renderStoredSummary(updated);
+    } catch (error) {
+      this.setError(`Could not rebuild the ${difficulty} chart: ${describeError(error)}`);
+      setProgress({ stage: 'done', ratio: 0, detail: 'failed' });
+    } finally {
+      this.busy = false;
     }
   }
 
@@ -277,65 +504,65 @@ export class ImportPanel {
       this.libraryList.innerHTML = '<span class="fine">Nothing saved yet. Imported songs appear here.</span>';
       return;
     }
-    this.libraryList.innerHTML = summaries
-      .map((summary) => {
-        const format = summary.audio.transcoded ? 'OGG (converted)' : summary.audio.format.toUpperCase();
-        const audio = summary.audio.stored ? `${format} · ${formatBytes(summary.audio.bytes)}` : 'audio not stored';
-        const flag = summary.validationOk ? '' : ' <span class="warn-tag">chart failed validation</span>';
-        return (
-          `<div class="library-row" data-song-id="${escapeHtml(summary.id)}">` +
-          `<div class="library-info"><strong>${escapeHtml(summary.title)}</strong>` +
-          `<span>${formatDuration(summary.durationMs)} · ${summary.bpm.toFixed(1)} BPM · ${summary.noteCount} notes · ${audio}${flag}</span></div>` +
-          `<div class="library-actions">` +
-          `<button type="button" class="btn btn-small" data-action="play"${summary.audio.stored ? '' : ' disabled'}>Play</button>` +
-          `<button type="button" class="btn btn-ghost btn-small" data-action="diagnostics">Diagnostics</button>` +
-          `<button type="button" class="btn btn-ghost btn-small" data-action="delete">Delete</button>` +
-          '</div></div>'
-        );
-      })
-      .join('');
+    const rows = await Promise.all(summaries.map((summary) => this.renderLibraryRow(summary)));
+    this.libraryList.innerHTML = rows.join('');
   }
 
-  private playImported(): void {
-    const outcome = this.outcome;
-    if (!outcome) {
-      this.setError('Import a song first.');
-      return;
+  /** One library row: title, numbers, and a play button per available difficulty. */
+  private async renderLibraryRow(summary: SongSummary): Promise<string> {
+    const format = summary.audio.transcoded ? 'OGG (converted)' : summary.audio.format.toUpperCase();
+    const audio = summary.audio.stored ? `${format} · ${formatBytes(summary.audio.bytes)}` : 'audio not stored';
+    const flag = summary.validationOk ? '' : ' <span class="warn-tag">chart failed validation</span>';
+    const buttons: string[] = [];
+    for (const entry of summary.charts) {
+      const best = await this.safeBest(summary.id, entry.difficulty);
+      const label = `${entry.difficulty} ${entry.laneCount}K`;
+      const title = `${entry.noteCount} notes · ${entry.notesPerSecond.toFixed(2)}/s · max ${entry.maxScore.toLocaleString('en-US')}${
+        best ? ` · best ${best.score.toLocaleString('en-US')}` : ''
+      }`;
+      buttons.push(
+        `<button type="button" class="btn btn-small" data-action="play" data-difficulty="${entry.difficulty}" ` +
+          `title="${escapeHtml(title)}"${summary.audio.stored ? '' : ' disabled'}>${escapeHtml(label)}</button>`,
+      );
     }
-    let chart: Beatmap;
+    // Missing difficulties are offered as a *regeneration*, never as a hidden-lane imitation.
+    for (const difficulty of CHART_DIFFICULTIES) {
+      if (summary.difficulties.includes(difficulty)) continue;
+      buttons.push(
+        `<button type="button" class="btn btn-ghost btn-small" data-action="regenerate" data-difficulty="${difficulty}" ` +
+          `title="Build the ${difficulty} chart from the stored audio (re-analyses this song once)"` +
+          `${summary.audio.stored ? '' : ' disabled'}>+ ${difficulty}</button>`,
+      );
+    }
+    buttons.push('<button type="button" class="btn btn-ghost btn-small" data-action="diagnostics">Diagnostics</button>');
+    buttons.push('<button type="button" class="btn btn-ghost btn-small" data-action="delete">Delete</button>');
+    return (
+      `<div class="library-row" data-song-id="${escapeHtml(summary.id)}">` +
+      `<div class="library-info"><strong>${escapeHtml(summary.title)}</strong>` +
+      `<span>${formatDuration(summary.durationMs)} · ${summary.bpm.toFixed(1)} BPM · ${audio}${flag}</span></div>` +
+      `<div class="library-actions">${buttons.join('')}</div></div>`
+    );
+  }
+
+  private async safeBest(songId: string, difficulty: ChartDifficulty): Promise<ScoreEntry | null> {
     try {
-      chart = prepareBeatmap(outcome.chart);
-    } catch (error) {
-      this.setError(describeError(error));
-      return;
+      return await this.deps.store.scores.best(songId, difficulty);
+    } catch {
+      return null;
     }
-    this.deps.onPlay({
-      chart,
-      buffer: outcome.buffer,
-      record: outcome.record,
-      fromLibrary: false,
-      source: 'import',
-      diagnostics: buildDiagnostics({
-        source: outcome.record.title,
-        analysis: outcome.analysis,
-        chart,
-        stats: outcome.stats,
-        validation: outcome.validation,
-        chartWarnings: outcome.warnings.filter((warning) => warning.startsWith('no ') || warning.includes('chord')),
-        audio: outcome.buffer,
-      }),
-    });
   }
 
   private emitDiagnostics(outcome?: ImportOutcome): void {
     if (outcome) {
+      const opening = primaryChart(outcome.set) ?? null;
+      const entry = opening ? outcome.set.charts[opening.difficulty] : undefined;
       this.deps.onDiagnostics(
         buildDiagnostics({
           source: outcome.record.title,
           analysis: outcome.analysis,
-          chart: outcome.chart,
-          stats: outcome.stats,
-          validation: outcome.validation,
+          chart: entry?.chart ?? outcome.chart,
+          stats: entry?.stats ?? outcome.stats,
+          validation: entry?.validation ?? outcome.validation,
           chartWarnings: outcome.warnings,
           audio: outcome.buffer,
         }),
@@ -345,34 +572,154 @@ export class ImportPanel {
     if (this.outcome) this.emitDiagnostics(this.outcome);
   }
 
+  private diagnosticsFor(
+    source: string,
+    set: ChartSet,
+    difficulty: ChartDifficulty,
+    analysis: ImportOutcome['analysis'] | null,
+    audio: AudioBuffer | null,
+    warnings: readonly string[],
+  ): DiagnosticsData {
+    const entry = set.charts[difficulty];
+    return buildDiagnostics({
+      source: `${source} · ${difficulty}`,
+      ...(analysis ? { analysis } : {}),
+      chart: entry?.chart ?? set.charts[primaryChart(set)?.difficulty ?? difficulty]!.chart,
+      ...(entry ? { stats: entry.stats, validation: entry.validation } : {}),
+      chartWarnings: warnings,
+      audio,
+    });
+  }
+
+  /** Diagnostics for a stored song: numbers from the record, audio decoded only on demand. */
+  private diagnosticsForRecord(record: SongRecord, blob: Blob | null, difficulty?: ChartDifficulty): DiagnosticsData {
+    const primary = primaryChartOf(record);
+    const wanted = difficulty && record.charts[difficulty] ? difficulty : primary.difficulty;
+    const chart = chartOf(record, wanted);
+    const info = record.charts[wanted]!;
+    return buildDiagnostics({
+      source: `${record.title} · ${wanted} (from the library, no re-analysis)`,
+      analysis: storedAnalysisView(record),
+      onsetsStored: false,
+      chart,
+      stats: info.stats,
+      chartWarnings: record.analysis.warnings,
+      // Decoded only when the player presses play in the preview: opening the report must be
+      // instant even for a ten-minute song.
+      ...(blob
+        ? {
+            loadAudio: async () => {
+              const context = await this.deps.getContext();
+              return decodeAudioBlob(blob, context);
+            },
+          }
+        : {}),
+    });
+  }
+
   private renderOutcome(outcome: ImportOutcome): void {
     setProgress({ stage: 'done', ratio: 1, detail: outcome.saved ? 'saved to this device' : 'ready to play' });
     setHidden(this.results, false);
     setText(this.analyzedTitle, `· ${outcome.record.title}`);
+    const opening = primaryChart(outcome.set) ?? null;
+    const entry = opening ? outcome.set.charts[opening.difficulty] : undefined;
     this.renderStats({
       bpm: outcome.analysis.bpm,
       confidence: outcome.analysis.beatConfidence,
       alignment: outcome.analysis.beatAlignRatio,
       beatCount: outcome.analysis.beats.length,
       onsetCount: outcome.analysis.onsets.length,
-      noteCount: outcome.stats.noteCount,
-      peakNotesPerSecond: outcome.stats.peakNotesPerSecond,
-      notesPerSecond: outcome.stats.notesPerSecond,
+      noteCount: entry?.stats.noteCount ?? 0,
+      peakNotesPerSecond: entry?.stats.peakNotesPerSecond ?? 0,
+      notesPerSecond: entry?.stats.notesPerSecond ?? 0,
       analysisMs: outcome.analysis.analysisMs,
       framesAnalyzed: outcome.analysis.framesAnalyzed,
     });
+    this.renderDifficulties(outcome.record, outcome.set);
 
     // Only the non-diagnostic notice stays here: the analysis and chart warnings are listed inside
-    // the diagnostics section, directly under the numbers they are about (phase 2.1). Repeating
-    // them above it just makes the panel noisier without adding information.
+    // the diagnostics section, directly under the numbers they are about. Repeating them above it
+    // just makes the panel noisier without adding information.
     const messages: string[] = [];
     if (outcome.ogg) {
       messages.push(
         `Converted to OGG Vorbis (${formatBytes(outcome.ogg.bytes)}) — the original is no longer the stored copy.`,
       );
     }
+    const missing = CHART_DIFFICULTIES.filter((difficulty) => outcome.charts[difficulty] === undefined);
+    if (missing.length > 0) {
+      messages.push(`No chart was saved for: ${missing.join(', ')} (they failed validation on this track).`);
+    }
     setHidden(this.warnings, messages.length === 0);
     this.warnings.textContent = messages.join('\n');
+  }
+
+  /**
+   * Render the difficulty cards.
+   *
+   * Every number comes from the chart that will actually load, plus the stored best score for that
+   * difficulty. Unavailable difficulties (a pre-phase-3 record) are rendered as an explicit offer to
+   * regenerate rather than as a disabled control with no explanation.
+   */
+  private async renderDifficulties(record: SongRecord, set: ChartSet): Promise<void> {
+    this.storedRecord = record;
+    this.storedSet = set;
+    const available = availableDifficulties(set);
+    const cards: string[] = [];
+    for (const difficulty of CHART_DIFFICULTIES) {
+      const profile = difficultyProfile(difficulty);
+      const summary = difficultySummary(set, difficulty);
+      if (!summary) {
+        cards.push(
+          `<div class="difficulty-card" data-available="false" data-difficulty="${difficulty}">` +
+            `<div class="difficulty-head"><strong>${escapeHtml(profile.title)}</strong><span class="difficulty-keys">${escapeHtml(
+              profile.keys.map((key) => key.label).join(' '),
+            )}</span></div>` +
+            `<p class="difficulty-summary">No chart was generated for this difficulty.</p>` +
+            `<div class="difficulty-actions">` +
+            `<button type="button" class="btn btn-ghost btn-small" data-action="regenerate" data-difficulty="${difficulty}"${
+              record.audio.stored ? '' : ' disabled'
+            }>Regenerate from stored audio</button>` +
+            `</div></div>`,
+        );
+        continue;
+      }
+      const best = await this.safeBest(record.id, difficulty);
+      const bestLine = best
+        ? `best ${best.score.toLocaleString('en-US')} · ${formatPercent(best.accuracy)} · ${best.grade}` +
+          (best.difficultyWeight !== profile.scoreWeight ? ' (older weight)' : '')
+        : 'no score yet';
+      cards.push(
+        `<div class="difficulty-card" data-available="${summary.valid ? 'true' : 'false'}" data-difficulty="${difficulty}">` +
+          `<div class="difficulty-head"><strong>${escapeHtml(profile.title)}</strong><span class="difficulty-keys">${escapeHtml(
+            profile.keys.map((key) => key.label).join(' '),
+          )}</span></div>` +
+          `<p class="difficulty-summary">${escapeHtml(profile.summary)}</p>` +
+          `<dl class="difficulty-stats">` +
+          `<div><dt>lanes</dt><dd>${summary.laneCount}</dd></div>` +
+          `<div><dt>notes</dt><dd>${summary.noteCount.toLocaleString('en-US')}</dd></div>` +
+          `<div><dt>notes / s</dt><dd>${summary.notesPerSecond.toFixed(2)}</dd></div>` +
+          `<div><dt>score weight</dt><dd>×${summary.scoreWeight.toFixed(1)}</dd></div>` +
+          `<div><dt>max score</dt><dd>${summary.maxScore.toLocaleString('en-US')}</dd></div>` +
+          `</dl>` +
+          `<div class="difficulty-best">${escapeHtml(bestLine)}</div>` +
+          `<div class="difficulty-actions">` +
+          `<button type="button" class="btn btn-primary btn-small" data-difficulty="${difficulty}"${
+            summary.valid ? '' : ' disabled'
+          }>Play</button>` +
+          `</div></div>`,
+      );
+    }
+    this.difficultyOptions.innerHTML = cards.join('');
+    const missing = CHART_DIFFICULTIES.filter((difficulty) => !available.includes(difficulty));
+    setHidden(this.difficultyNote, missing.length === 0);
+    setText(
+      this.difficultyNote,
+      missing.length === 0
+        ? ''
+        : `This song only has a chart for: ${available.join(', ')}. “Regenerate” re-analyses the stored audio once ` +
+          'and saves the missing difficulties (nothing is invented from the existing chart).',
+    );
   }
 
   /** The summary grid, shared by a fresh import and a song reopened from the library. */
@@ -399,23 +746,27 @@ export class ImportPanel {
   }
 
   /** Summary for a stored song: the record holds every number except the onset list. */
-  private renderStoredSummary(record: SongRecord, chart: Beatmap): void {
+  private renderStoredSummary(record: SongRecord): void {
     setHidden(this.progressWrap, true);
     setHidden(this.results, false);
-    setText(this.analyzedTitle, `· ${record.title} (saved chart, no re-analysis)`);
+    setText(this.analyzedTitle, `· ${record.title} (saved, no re-analysis)`);
+    const primary = primaryChartOf(record);
+    const info = record.charts[primary.difficulty]!;
     this.renderStats({
       bpm: record.bpm,
       confidence: record.beatConfidence,
       alignment: record.analysis.beatAlignRatio,
       beatCount: record.analysis.beatCount,
       onsetCount: 0,
-      noteCount: chart.notes.length,
-      peakNotesPerSecond: record.chart.stats.peakNotesPerSecond,
-      notesPerSecond: record.chart.stats.notesPerSecond || (record.durationMs > 0 ? (chart.notes.length / record.durationMs) * 1000 : 0),
+      noteCount: info.noteCount || info.notes.length,
+      peakNotesPerSecond: info.stats.peakNotesPerSecond,
+      notesPerSecond:
+        info.stats.notesPerSecond || (record.durationMs > 0 ? ((info.noteCount || info.notes.length) / record.durationMs) * 1000 : 0),
       analysisMs: record.analysis.analysisMs,
       framesAnalyzed: record.analysis.framesAnalyzed,
     });
     setHidden(this.warnings, true);
+    void this.renderDifficulties(record, chartSetOf(record, record.analysis.warnings));
   }
 
   private async refreshOggHint(): Promise<void> {
@@ -450,7 +801,6 @@ export class ImportPanel {
     setHidden(this.errorBox, message === null);
     this.errorBox.textContent = message ?? '';
   }
-
 }
 
 function setProgress(progress: ImportProgress): void {
@@ -501,6 +851,35 @@ function storedAnalysisView(record: SongRecord) {
     energy,
     sections: info.sections,
     lowConfidenceRanges: info.lowConfidenceRanges,
+  };
+}
+
+/**
+ * Persisted info for a regenerated chart.
+ *
+ * `SongRecord.chartInfoOf` is the canonical converter (it is what `buildSongRecord` uses); this
+ * thin wrapper only exists because the record's own helper is not exported — keeping one converter
+ * is more important than avoiding the two lines below, so the shape is spelled out here exactly as
+ * the storage layer writes it.
+ */
+function chartInfoOf(entry: DifficultyChart): NonNullable<SongRecord['charts'][ChartDifficulty]> {
+  const laneCount = entry.chart.laneCount ?? 7;
+  return {
+    schemaVersion: entry.chart.schemaVersion,
+    difficulty: entry.chart.difficulty,
+    laneCount,
+    keyLabels: entry.chart.keyLabels ?? difficultyProfile(entry.difficulty).keys.map((key) => key.label),
+    generator: { ...entry.chart.generator },
+    noteCount: entry.chart.notes.length,
+    notes: entry.chart.notes.map((note) => ({ ...note })),
+    stats: { ...entry.stats },
+    maxScore: entry.chart.maxScore ?? 0,
+    noteDensity: entry.chart.noteDensity ?? entry.stats.notesPerSecond,
+    validation: {
+      ok: entry.validation.ok,
+      errors: entry.validation.errors.map((issue) => `${issue.code}: ${issue.message}`),
+      warnings: entry.validation.warnings.map((issue) => `${issue.code}: ${issue.message}`),
+    },
   };
 }
 
