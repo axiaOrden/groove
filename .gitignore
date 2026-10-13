@@ -1,0 +1,76 @@
+# Dependencies and package-manager caches
+node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+*.tsbuildinfo
+
+# Vite and production build output
+dist/
+dist-ssr/
+.vite/
+
+# Test, coverage, and temporary reports
+coverage/
+.vitest/
+test-results/
+playwright-report/
+reports/
+*.lcov
+
+# Logs and runtime diagnostics
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+vite.config.*.timestamp-*
+
+# Environment and secret-bearing local configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.local
+
+# Editors, operating systems, and local tooling
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+.freebuff/
+
+# Temporary files and local analysis/import output
+tmp/
+temp/
+.cache/
+*.tmp
+*.temp
+analysis-results/
+generated-music/
+transcoded-audio/
+imports/
+uploads/
+
+# Audio in test-assets is denied by default so personal/copyrighted music cannot
+# be added accidentally. Explicitly keep only the reproducible synthetic fixtures.
+/test-assets/*
+!/test-assets/make_fixtures.py
+!/test-assets/rx128.wav
+!/test-assets/rx128.mp3
+!/test-assets/rx96.wav
+!/test-assets/rx96.mp3
+!/test-assets/dense.wav
+!/test-assets/dense.mp3
+!/test-assets/quiet.wav
+!/test-assets/quiet.mp3
+!/test-assets/silence.wav
+!/test-assets/silence.mp3
+!/test-assets/short.wav
+!/test-assets/short.mp3

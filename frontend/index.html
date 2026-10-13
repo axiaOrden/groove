@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      viewport-fit=cover opts into display cutouts so env(safe-area-inset-*) reports the real
+      notch in landscape instead of the browser letterboxing the viewport. Pinch zoom is left
+      enabled for accessibility: `touch-action: none` on the gameplay surface is what stops the
+      double-tap zoom and page scrolling during play.
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#05070d" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <title>Seven Keys — O2Jam-inspired seven-key rhythm game</title>
+    <meta
+      name="description"
+      content="Seven Keys: an original seven-key falling-note rhythm game demo built with TypeScript, Vite and Three.js."
+    />
+    <link rel="icon" href="data:," />
+  </head>
+  <body>
+    <!--
+      Static UI skeleton. Everything that changes per frame (note lanes, effects) lives in
+      the Three.js canvas; everything textual lives here and is driven from src/ui/*.ts.
+      Element ids are part of a contract: src/ui/dom.ts throws at startup if any is missing.
+    -->
+    <div id="stage">
+      <canvas id="game-canvas" aria-label="Seven-lane note highway"></canvas>
+
+      <!--
+        Touch lane columns (phase 1.5). Built and positioned by src/ui/TouchSurface.ts from
+        the same camera projection that draws the 3D lanes. It sits *before* the HUD in the
+        DOM so the HUD buttons paint and hit-test above it, and it is hidden unless the game is
+        actually playing.
+      -->
+      <div id="touch-layer" class="layer touch-layer" hidden></div>
+
+      <!-- Heads-up display -->
+      <div id="hud" class="layer" hidden>
+        <div class="hud-top">
+          <div class="hud-block hud-left">
+            <div class="hud-song" id="hud-song-title">Seven Keys Demo</div>
+            <div class="hud-sub" id="hud-song-sub">normal · 150 BPM · seeded demo chart</div>
+          </div>
+
+          <div class="hud-block hud-center">
+            <div class="hud-score" id="hud-score">0</div>
+            <div class="hud-sub">score</div>
+          </div>
+
+          <div class="hud-block hud-right">
+            <div class="hud-time" id="hud-time">0:00 / 0:00</div>
+            <div class="hud-sub" id="hud-fps">-- fps</div>
+          </div>
+        </div>
+
+        <div class="progress"><div class="progress-fill" id="hud-progress"></div></div>
+
+        <div class="hud-stats" id="hud-stats">
+          <div class="stat"><span class="stat-label">accuracy</span><span id="stat-accuracy">100.00%</span></div>
+          <div class="stat"><span class="stat-label">max combo</span><span id="stat-maxcombo">0</span></div>
+          <div class="stat"><span class="stat-label">perfect</span><span id="stat-perfect">0</span></div>
+          <div class="stat"><span class="stat-label">good</span><span id="stat-good">0</span></div>
+          <div class="stat"><span class="stat-label">bad</span><span id="stat-bad">0</span></div>
+          <div class="stat"><span class="stat-label">miss</span><span id="stat-miss">0</span></div>
+          <div class="stat"><span class="stat-label">holds kept</span><span id="stat-holds">0</span></div>
+        </div>
+
+        <div class="combo" id="hud-combo" data-visible="false">
+          <div class="combo-value" id="hud-combo-value">0</div>
+          <div class="combo-label">combo</div>
+        </div>
+
+        <div class="judgement-layer" id="judgement-layer" aria-hidden="true"></div>
+
+        <div class="countdown" id="hud-countdown" data-visible="false"></div>
+
+        <div class="hud-bottom">
+          <div class="keys" id="key-hints"></div>
+          <div class="hud-buttons">
+            <button type="button" class="btn btn-ghost" id="btn-pause" title="Pause (Esc)">⏸ Pause <kbd>Esc</kbd></button>
+            <button type="button" class="btn btn-ghost" id="btn-restart" title="Restart (R)">⟲ Restart <kbd>R</kbd></button>
+            <button type="button" class="btn btn-ghost btn-icon" id="btn-fullscreen" title="Enter fullscreen">⛶</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Overlays: loading / ready / pause / results -->
+      <div id="overlay" class="layer">
+        <section class="panel" id="panel-loading">
+          <h1 class="brand">Seven<span>Keys</span></h1>
+          <p class="lead" id="loading-status">Preparing the demo track…</p>
+          <div class="progress progress-lg"><div class="progress-fill" id="loading-progress"></div></div>
+          <p class="fine">The demo song is synthesised locally in your browser — no audio file is downloaded.</p>
+        </section>
+
+        <section class="panel" id="panel-ready" hidden>
+          <h1 class="brand">Seven<span>Keys</span></h1>
+          <p class="lead">
+            Seven lanes. <strong>A S D</strong> · <strong>Space</strong> · <strong>J K L</strong>. Hit the notes as they
+            cross the hit line. Holds must stay pressed until the tail arrives.
+          </p>
+
+          <div class="settings">
+            <label class="setting">
+              <span class="setting-title">Global offset <em id="setting-offset-value">0 ms</em></span>
+              <input type="range" id="setting-offset" min="-200" max="200" step="5" value="0" />
+              <span class="setting-hint">
+                Positive value = your key presses tend to land <em>late</em> (or your audio is delayed), so presses are
+                judged earlier. Check the timing offset against a generated chart's beat ticks in Diagnostics.
+              </span>
+            </label>
+
+            <label class="setting">
+              <span class="setting-title">Note speed <em id="setting-speed-value">1.0×</em></span>
+              <input type="range" id="setting-speed" min="0.5" max="2.5" step="0.1" value="1" />
+              <span class="setting-hint">Scales how long notes stay visible before the hit line. Purely visual.</span>
+            </label>
+
+            <label class="setting">
+              <span class="setting-title">Volume <em id="setting-volume-value">70%</em></span>
+              <input type="range" id="setting-volume" min="0" max="100" step="5" value="70" />
+              <span class="setting-hint">Master output for the demo track and hit feedback.</span>
+            </label>
+          </div>
+
+          <div class="panel-actions">
+            <button type="button" class="btn btn-primary" id="btn-start">Start demo chart</button>
+            <button type="button" class="btn" id="btn-open-import">Import an MP3 ▸</button>
+            <button type="button" class="btn" id="btn-fullscreen-ready">
+              <span data-role="label">⤢ Fullscreen</span>
+            </button>
+          </div>
+          <p class="fine">
+            Pick a local MP3 and the analyser estimates the tempo, measures how well the beat grid matches the music,
+            finds the onsets and builds a seven-lane chart you can play straight away. After importing, Diagnostics
+            shows the numbers and an onset / beat / note timeline you can play back with clicks over the music. The demo
+            chart stays available for comparison.
+          </p>
+        </section>
+
+        <!--
+          Import workflow (phase 2): pick a file -> analyse -> review the analysis -> generate a
+          chart -> play it -> save it locally. Driven by src/ui/ImportPanel.ts.
+        -->
+        <section class="panel panel-wide" id="panel-import" hidden>
+          <h2 class="panel-title">Import a song</h2>
+          <p class="lead">
+            Everything runs in your browser: the file never leaves this device. Analysis happens in a Web Worker, so the
+            interface stays responsive.
+          </p>
+
+          <div class="import-grid">
+            <label class="drop-zone" id="import-drop">
+              <input type="file" id="import-file" accept="audio/*,.mp3,.m4a,.wav,.ogg,.flac,.opus" />
+              <span class="drop-title">Choose an audio file</span>
+              <span class="drop-sub">MP3, M4A, WAV, OGG, FLAC · up to 60 MB</span>
+            </label>
+
+            <div class="import-meta">
+              <div class="import-file-name" id="import-file-name">No file selected</div>
+              <label class="setting setting-inline">
+                <span class="setting-title">Title</span>
+                <input type="text" id="import-title" maxlength="80" placeholder="from the file name" />
+              </label>
+              <label class="setting setting-inline">
+                <span class="setting-title">Chart seed</span>
+                <input type="number" id="import-seed" min="1" max="999999" step="1" value="1" />
+              </label>
+              <label class="setting setting-inline setting-check">
+                <input type="checkbox" id="import-save" checked />
+                <span>Save to this device</span>
+              </label>
+              <label class="setting setting-inline setting-check">
+                <input type="checkbox" id="import-ogg" />
+                <span>Convert to OGG Vorbis (optional)</span>
+              </label>
+              <span class="setting-hint" id="import-ogg-hint">
+                Off by default: transcoding decodes and re-encodes the audio, which adds a second generation of loss and
+                saves almost no space. The original file is kept when this is off.
+              </span>
+            </div>
+          </div>
+
+          <div class="import-progress" id="import-progress-wrap" hidden>
+            <div class="import-stage" id="import-stage">idle</div>
+            <div class="progress progress-lg"><div class="progress-fill" id="import-progress"></div></div>
+            <div class="import-status" id="import-status"></div>
+          </div>
+
+          <div class="import-error" id="import-error" hidden></div>
+
+          <div class="import-results" id="import-results" hidden>
+            <h3 class="import-heading">Analysis <span id="import-analyzed-title"></span></h3>
+            <div class="import-stats" id="import-stats">
+              <div class="import-stat"><span>estimated BPM</span><strong id="import-stat-bpm">--</strong></div>
+              <div class="import-stat"><span>grid confidence</span><strong id="import-stat-confidence">--</strong></div>
+              <div class="import-stat"><span>beats</span><strong id="import-stat-beats">--</strong></div>
+              <div class="import-stat"><span>onsets</span><strong id="import-stat-onsets">--</strong></div>
+              <div class="import-stat"><span>generated notes</span><strong id="import-stat-notes">--</strong></div>
+              <div class="import-stat"><span>notes / second</span><strong id="import-stat-density">--</strong></div>
+              <div class="import-stat"><span>analysis time</span><strong id="import-stat-analysis">--</strong></div>
+            </div>
+            <div class="import-warnings" id="import-warnings" hidden></div>
+            <div class="panel-actions">
+              <button type="button" class="btn btn-primary" id="btn-import-play">Play this chart</button>
+              <button type="button" class="btn" id="btn-diagnostics">Advanced diagnostics</button>
+              <button type="button" class="btn btn-ghost" id="btn-import-back">Back</button>
+            </div>
+
+            <!--
+              Diagnostics (phase 2.1): the numbers live with the analysis they describe, and the
+              detailed timeline / preview is one collapsed section below them. Driven by
+              src/ui/DiagnosticsPanel.ts; rendered for a fresh import and for a saved song.
+            -->
+            <div class="diag" id="diag-panel">
+              <div class="diag-head">
+                <strong>Diagnostics</strong>
+                <span class="diag-sub" id="diag-source">no song analysed</span>
+              </div>
+              <div class="diag-grid" id="diag-numbers"></div>
+              <div class="diag-warnings" id="diag-warnings"></div>
+              <div class="diag-lows" id="diag-lows"></div>
+
+              <details class="diag-advanced" id="diag-advanced">
+                <summary>Advanced diagnostics — onset / beat / note timeline, tempo candidates, density</summary>
+                <p class="fine">
+                  Click the timeline to choose an eight-second section, then play it with a beat tick and note blips over
+                  the music. The timeline shows beats (blue, downbeats brighter), detected onsets coloured by spectral band
+                  and generated notes (SPACE drawn taller).
+                </p>
+                <canvas id="diag-timeline" width="880" height="138"></canvas>
+                <div class="diag-legend">
+                  <span class="legend legend-beat">beats</span>
+                  <span class="legend legend-low">low onsets</span>
+                  <span class="legend legend-high">mid/high onsets</span>
+                  <span class="legend legend-note">notes</span>
+                  <span class="legend legend-space">SPACE</span>
+                  <span class="legend legend-quiet">low energy</span>
+                  <span class="legend legend-weak">weak pulse</span>
+                </div>
+                <div class="diag-controls">
+                  <button type="button" class="btn btn-small" id="btn-preview-section">▶ Play selected section</button>
+                  <button type="button" class="btn btn-ghost btn-small" id="btn-preview-stop">■ Stop</button>
+                  <label class="diag-check"><input type="checkbox" id="preview-beats" checked /> beat tick</label>
+                  <label class="diag-check"><input type="checkbox" id="preview-notes" checked /> note blips</label>
+                  <span class="diag-selection" id="diag-selection"></span>
+                </div>
+                <div class="diag-preview-info fine" id="preview-info"></div>
+                <div class="diag-tables" id="diag-tables"></div>
+              </details>
+            </div>
+          </div>
+
+          <h3 class="import-heading">Saved on this device</h3>
+          <div class="library" id="library-list"><span class="fine">Loading…</span></div>
+          <div class="library-note fine" id="library-note" hidden></div>
+        </section>
+
+        <section class="panel" id="panel-pause" hidden>
+          <h2 class="panel-title">Paused</h2>
+          <p class="lead">The audio clock is frozen. Notes resume exactly where they stopped.</p>
+          <div class="panel-actions">
+            <button type="button" class="btn btn-primary" id="btn-resume">Resume <kbd>Esc</kbd></button>
+            <button type="button" class="btn" id="btn-restart-2">Restart <kbd>R</kbd></button>
+            <button type="button" class="btn btn-ghost" id="btn-back">Back to menu</button>
+          </div>
+        </section>
+
+        <section class="panel" id="panel-results" hidden>
+          <h2 class="panel-title">Results</h2>
+          <div class="results">
+            <div class="result-grade" id="result-grade">S</div>
+            <div class="result-score">
+              <div class="result-score-value" id="result-score">0</div>
+              <div class="result-score-label" id="result-accuracy">100.00% accuracy</div>
+            </div>
+          </div>
+          <table class="results-table">
+            <tbody>
+              <tr><th>Max combo</th><td id="result-maxcombo">0</td></tr>
+              <tr><th>Perfect</th><td id="result-perfect">0</td></tr>
+              <tr><th>Good</th><td id="result-good">0</td></tr>
+              <tr><th>Bad</th><td id="result-bad">0</td></tr>
+              <tr><th>Miss</th><td id="result-miss">0</td></tr>
+              <tr><th>Holds completed</th><td id="result-holds-completed">0</td></tr>
+              <tr><th>Holds broken</th><td id="result-holds-broken">0</td></tr>
+              <tr><th>Stray presses</th><td id="result-stray">0</td></tr>
+              <tr><th>Notes</th><td id="result-notes">0</td></tr>
+            </tbody>
+          </table>
+          <div class="panel-actions">
+            <button type="button" class="btn btn-primary" id="btn-retry">Play again <kbd>R</kbd></button>
+            <button type="button" class="btn btn-ghost" id="btn-back-2">Back to menu</button>
+          </div>
+        </section>
+      </div>
+
+      <!--
+        Portrait gate for touch devices: the seven-lane highway needs width, so in portrait we
+        ask the player to rotate (and offer fullscreen + landscape lock, which is the only way
+        to lock the orientation on Android). Controlled by src/ui/OrientationGate.ts.
+      -->
+      <div id="rotate-overlay" class="layer rotate-overlay" hidden>
+        <div class="rotate-card" role="dialog" aria-labelledby="rotate-title">
+          <div class="rotate-icon" aria-hidden="true"><span></span></div>
+          <h2 class="panel-title" id="rotate-title">Rotate your device</h2>
+          <p class="lead">
+            Seven Keys plays in landscape: seven lane columns need the full width of the screen, and
+            the touch pads belong under your thumbs. Turn the phone sideways to keep playing.
+          </p>
+          <div class="panel-actions">
+            <button type="button" class="btn btn-primary" id="btn-fullscreen-rotate">
+              <span data-role="label">⤢ Fullscreen</span>
+            </button>
+            <button type="button" class="btn btn-ghost" id="btn-portrait-continue">Continue in portrait</button>
+          </div>
+          <p class="fine">
+            Fullscreen also enables the landscape orientation lock on Android Chrome. Firefox does not
+            support locking, so it will simply stay rotated by hand.
+          </p>
+        </div>
+      </div>
+
+      <div id="error-banner" class="error-banner" hidden></div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

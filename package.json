@@ -1,0 +1,20 @@
+{
+  "name": "seven-keys-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Seven Keys — an original O2Jam-inspired seven-key browser rhythm game. Root workspace wrapper.",
+  "workspaces": [
+    "frontend"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace seven-keys",
+    "build": "npm run build --workspace seven-keys",
+    "preview": "npm run preview --workspace seven-keys",
+    "test": "npm run test --workspace seven-keys",
+    "test:watch": "npm run test:watch --workspace seven-keys",
+    "typecheck": "npm run typecheck --workspace seven-keys"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
